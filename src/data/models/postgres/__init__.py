@@ -1,0 +1,11 @@
+from src.data.clients.postgres_client import Base  # noqa: F401
+from src.data.models.postgres.issue_model import Issue  # noqa: F401
+from src.data.models.postgres.sla_model import SLA  # noqa: F401
+from src.data.models.postgres.issue_resolver_model import IssueResolver  # noqa: F401
+from src.data.models.postgres.ticket_model import Ticket  # noqa: F401
+from src.data.models.postgres.comment_model import Comment  # noqa: F401
+from src.data.models.postgres.ticket_audit_model import TicketAudit  # noqa: F401
+from src.data.models.postgres.notification_model import Notification  # noqa: F401
+from src.data.models.postgres.email_thread_model import EmailThread  # noqa: F401
+from src.data.models.postgres.escalation_model import Escalation  # noqa: F401  
+from src.data.models.postgres.email_config_model import EmailConfig  # noqa: F401  
