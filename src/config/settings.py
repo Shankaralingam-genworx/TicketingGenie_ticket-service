@@ -18,9 +18,6 @@ class Settings(BaseSettings):
     GROQ_API_KEY: str
     GROQ_MODEL: str 
     
-    
-    INTERNAL_API_KEY: str
-    
     EMAIL_FROM : str
     SMTP_HOST : str
     SMTP_PORT : str
