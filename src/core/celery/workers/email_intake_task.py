@@ -159,7 +159,7 @@ def _fetch_unseen_messages() -> list[tuple[bytes, bytes]]:
     name    = "src.core.celery.workers.email_intake_task.poll_support_inbox_task",
     bind    = True,
     max_retries = 0,
-    queue   = "email",
+    queue   = "ticket_email",
     time_limit      = 300,
     soft_time_limit = 240,
 )

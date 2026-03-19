@@ -1,25 +1,10 @@
-"""
-JWT validation middleware — validates token locally using the shared secret.
-No call to Auth Service needed. User context (user_id, role, tier, team_id)
-injected into request.state.
-
-Fix: SSE endpoints (EventSource) cannot send custom headers, so the token
-is passed as a ?token= query parameter. This middleware checks both:
-  1. Authorization: Bearer <token>  header  (normal API calls)
-  2. ?token=<token>                 query   (SSE / EventSource)
-
-File path: src/api/middleware/auth_client_middleware.py
-"""
-
-import logging
-
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 from jose import jwt
 from jose.exceptions import ExpiredSignatureError, JWTError
-from starlette.middleware.base import BaseHTTPMiddleware
-
+import logging
 from src.config.settings import settings
+from starlette.middleware.base import BaseHTTPMiddleware
 
 logger = logging.getLogger("ticket.auth")
 
@@ -69,12 +54,15 @@ class AuthMiddleware(BaseHTTPMiddleware):
             request.state.role          = str(payload.get("role", ""))
             request.state.customer_tier = payload.get("customer_tier")
             request.state.team_id       = payload.get("team_id")
+            # org_id — present for org_admin and customer roles; NULL for staff
+            request.state.org_id        = payload.get("org_id")
 
             logger.debug(
                 f"Auth OK | user={request.state.user_id} "
                 f"role={request.state.role} "
                 f"tier={request.state.customer_tier} "
-                f"team={request.state.team_id}"
+                f"team={request.state.team_id} "
+                f"org={request.state.org_id}"
             )
 
         except ExpiredSignatureError:

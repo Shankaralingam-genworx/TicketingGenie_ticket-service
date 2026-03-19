@@ -1,17 +1,8 @@
-"""Notification ORM model.
-
-Cross-service ref: recipient_id → users.id (auth service, same DB).
-Stored as plain Integer — no ForeignKey() declaration to avoid
-NoReferencedTableError on create_all (users is not in this Base).
-"""
-
 from datetime import datetime, timezone
 from enum import Enum
-
 from sqlalchemy import BigInteger, Boolean, DateTime, ForeignKey, Integer, String, Text
 from sqlalchemy import Enum as SAEnum
 from sqlalchemy.orm import Mapped, mapped_column, relationship
-
 from src.data.clients.postgres_client import Base
 
 
@@ -35,14 +26,14 @@ class Notification(Base):
 
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
 
-    # Cross-service ref → auth service: users.id  (plain int, no FK declaration)
+    
     recipient_id: Mapped[int] = mapped_column(Integer, nullable=False, index=True)
 
     recipient_role: Mapped[str] = mapped_column(
         SAEnum(NotificationActor, name="notificationactor"), nullable=False
     )
 
-    # Intra-service FK — safe to declare
+    
     ticket_id: Mapped[int | None] = mapped_column(
         Integer,
         ForeignKey("tickets.id", ondelete="CASCADE"),
@@ -66,8 +57,8 @@ class Notification(Base):
         default=lambda: datetime.now(timezone.utc),
     )
 
-    # Intra-service relationship
-    ticket: Mapped["Ticket"] = relationship(  # noqa: F821
+    
+    ticket: Mapped["Ticket"] = relationship(  
         "Ticket", back_populates="notifications", lazy="noload"
     )
 

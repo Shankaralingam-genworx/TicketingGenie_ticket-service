@@ -1,10 +1,3 @@
-"""
-Attachment schema with validation.
-File: src/schemas/attachment_schema.py
-
-AttachmentMeta         — stored in the DB JSON column, returned in API responses
-validate_upload        — call this in the service layer before saving to disk
-"""
 
 from typing import Annotated
 from pydantic import BaseModel, field_validator, model_validator, Field
@@ -27,18 +20,7 @@ MAX_FILENAME_LENGTH: int = 255
 # ── Schema stored in DB + returned in API ────────────────────────────────────
 
 class AttachmentMeta(BaseModel):
-    """
-    One entry per uploaded file, stored as a JSON list in tickets.attachments.
 
-    Fields
-    ------
-    original_name : filename the user uploaded        e.g. "screenshot.png"
-    stored_name   : uuid-renamed file on disk         e.g. "a1b2c3d4.png"
-    content_type  : validated MIME type               e.g. "image/png"
-    size_bytes    : file size — validated ≤ 10 MB     e.g. 204800
-    path          : relative path on disk             e.g. "uploads/tickets/a1b2c3d4.png"
-    url           : URL served by FastAPI / S3 later  e.g. "/uploads/tickets/a1b2c3d4.png"
-    """
 
     original_name: str  = Field(..., max_length=MAX_FILENAME_LENGTH)
     stored_name:   str  = Field(..., min_length=1)
@@ -81,15 +63,7 @@ def validate_upload(
     content_type: str,
     size_bytes:   int,
 ) -> None:
-    """
-    Validate a file upload BEFORE writing to disk.
-    Raises UploadValidationError with a user-friendly message on failure.
-
-    Usage in service layer:
-        data = await file.read()
-        validate_upload(file.filename, file.content_type, len(data))
-        # safe to write to disk now
-    """
+  
     if content_type not in ALLOWED_MIME_TYPES:
         raise UploadValidationError(
             f"'{filename}' has unsupported type '{content_type}'. "

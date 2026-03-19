@@ -1,9 +1,7 @@
-"""WebSocket endpoint for real-time ticket collaboration."""
-
-import json
 from datetime import datetime, timezone
-
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
+import json
+
 
 router = APIRouter(prefix="/ws", tags=["WebSocket"])
 

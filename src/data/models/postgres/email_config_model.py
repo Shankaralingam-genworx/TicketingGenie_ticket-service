@@ -3,7 +3,6 @@ from sqlalchemy import Boolean, DateTime, Integer, String
 from sqlalchemy.orm import Mapped, mapped_column
 from src.data.clients.postgres_client import Base
 
-
 class EmailConfig(Base):
     __tablename__ = "email_configs"
 
@@ -11,7 +10,10 @@ class EmailConfig(Base):
     name: Mapped[str] = mapped_column(String(120), nullable=False,
                                       doc="Label e.g. 'Production Inbox'")
 
-    # Only the password is stored — email address + hosts come from settings.py
+    # Email address is stored alongside the password so the admin can configure
+    # the inbox without touching the server environment variables.
+    email:    Mapped[str] = mapped_column(String(255), nullable=False,
+                                          doc="Support inbox address e.g. support@company.com")
     password: Mapped[str] = mapped_column(String(255), nullable=False,
                                           doc="Gmail / Outlook app password")
 

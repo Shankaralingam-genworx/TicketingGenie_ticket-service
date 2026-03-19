@@ -35,9 +35,9 @@ celery_app.conf.update(
     # Keeps dev simple — one worker command handles everything.
     # In production you can split into separate queues per task group.
     task_routes = {
-        "src.core.celery.workers.email_tasks.*":       {"queue": "email"},
-        "src.core.celery.workers.sla_tasks.*":         {"queue": "email"},
-        "src.core.celery.workers.email_intake_task.*": {"queue": "email"},
+        "src.core.celery.workers.email_tasks.*":        {"queue": "ticket_email"},
+        "src.core.celery.workers.sla_tasks.*":          {"queue": "ticket_email"},
+        "src.core.celery.workers.email_intake_task.*":  {"queue": "ticket_email"},
     },
 
     task_acks_late                     = True,

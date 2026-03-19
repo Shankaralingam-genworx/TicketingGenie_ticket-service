@@ -2,11 +2,11 @@
 
 from fastapi import APIRouter, Depends, status
 from sqlalchemy.ext.asyncio import AsyncSession
-
 from src.api.dependencies import require_role
 from src.core.services.issue_resolver_service import IssueResolverService
 from src.data.clients.postgres_client import get_db
 from src.schemas.issue_resolver_schema import IssueResolverCreateRequest, IssueResolverResponse
+
 
 router = APIRouter(prefix="/issue-resolvers", tags=["Issue Resolvers"])
 

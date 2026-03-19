@@ -1,33 +1,25 @@
-"""FastAPI application factory for the Ticket Service.
-
-File path: src/api/rest/app.py
-
-Changes from original:
-  - Added import of notification_routes
-  - Added app.include_router(notification_routes.router, prefix="/api/v1")
-"""
-
 from fastapi import FastAPI
 from fastapi.openapi.utils import get_openapi
-
 from src.api.middleware.auth_client_middleware import add_auth_middleware
 from src.api.middleware.cors import add_cors_middleware
 from src.api.middleware.error_handler import add_error_handlers
 from src.api.middleware.logging import add_logging_middleware
+
 from src.api.rest.routes import (
     comment_routes,
     dashboard_routes,
+    email_config_routes,
     health,
     issue_resolver_routes,
     issue_routes,
-    notification_routes,  
+    notification_routes,
     sla_routes,
     sse,
     ticket_routes,
     websocket,
-    email_config_routes
 )
-
+from src.api.rest.routes.org_routes import router as org_router
+from src.api.rest.routes.severity_keyword_routes import router as severity_keyword_router
 
 def create_app() -> FastAPI:
     app = FastAPI(
@@ -51,8 +43,10 @@ def create_app() -> FastAPI:
     app.include_router(sla_routes.router,              prefix="/api/v1")
     app.include_router(comment_routes.router,          prefix="/api/v1")
     app.include_router(dashboard_routes.router,        prefix="/api/v1")
-    app.include_router(notification_routes.router,     prefix="/api/v1")  # ← NEW
-    app.include_router(email_config_routes.router,     prefix="/api/v1") 
+    app.include_router(notification_routes.router,     prefix="/api/v1")  
+    app.include_router(email_config_routes.router,     prefix="/api/v1")
+    app.include_router(org_router,                     prefix="/api/v1") 
+    app.include_router(severity_keyword_router,        prefix="/api/v1")  
     app.include_router(sse.router)
     app.include_router(websocket.router)
 

@@ -1,10 +1,8 @@
 """Issue ORM model — categories of problems a customer can raise a ticket for."""
 
 from datetime import datetime, timezone
-
 from sqlalchemy import Boolean, DateTime, Enum, String, Text
 from sqlalchemy.orm import Mapped, mapped_column, relationship
-
 from src.constants.issue_constants import IssueCategory
 from src.data.clients.postgres_client import Base
 

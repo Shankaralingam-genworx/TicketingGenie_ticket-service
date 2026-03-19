@@ -1,11 +1,9 @@
 """Server-Sent Events endpoint for real-time ticket updates."""
-
 import asyncio
-import json
 from datetime import datetime, timezone
-
 from fastapi import APIRouter
 from fastapi.responses import StreamingResponse
+import json
 
 router = APIRouter(prefix="/sse", tags=["SSE"])
 

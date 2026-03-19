@@ -11,17 +11,6 @@ from typing import Optional
 from pydantic import BaseModel, Field
 
 
-class TicketStatusBreakdown(BaseModel):
-    new: int = 0
-    acknowledged: int = 0
-    open: int = 0
-    in_progress: int = 0
-    on_hold: int = 0
-    resolved: int = 0
-    closed: int = 0
-    reopened: int = 0
-
-
 class PriorityBreakdown(BaseModel):
     """Open + in-progress tickets grouped by priority/severity."""
     critical: int = 0
@@ -31,10 +20,10 @@ class PriorityBreakdown(BaseModel):
 
 
 class SLABreachTrend(BaseModel):
-    """Daily SLA breach counts for the last N days."""
+    """Daily SLA breach counts for the last 7 days."""
     date: date
     breaches: int = Field(..., description="Tickets that breached SLA on this date")
-    total: int = Field(..., description="Total tickets created/active on this date")
+    total: int = Field(..., description="Total tickets created on this date")
 
 
 class ResponseTimeStat(BaseModel):
@@ -51,14 +40,13 @@ class ResponseTimeStat(BaseModel):
 class DashboardMetrics(BaseModel):
     # Core counts
     total_tickets: int
-    by_status: TicketStatusBreakdown
     open_tickets: int
     escalated_tickets: int
 
-    # Priority breakdown (open tickets only)
+    # Priority breakdown (open + in_progress tickets only)
     by_priority: Optional[PriorityBreakdown] = None
 
-    # Trend data (last 14 days)
+    # Trend data (last 7 days)
     sla_breach_trend: Optional[list[SLABreachTrend]] = None
     response_time_trend: Optional[list[ResponseTimeStat]] = None
 

@@ -1,11 +1,11 @@
 """Request/response logging middleware."""
 
+from fastapi import FastAPI, Request
 import logging
 import time
 import uuid
-
-from fastapi import FastAPI, Request
 from starlette.middleware.base import BaseHTTPMiddleware
+
 
 logger = logging.getLogger("ticket.middleware")
 

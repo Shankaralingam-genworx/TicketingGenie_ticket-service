@@ -10,7 +10,12 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.constants.sla_constants import AuditAction
 from src.constants.ticket_constants import TicketStatus
-from src.core.celery.workers.email_tasks import build_assignment_email, send_notification_task
+from src.core.celery.workers.email_tasks import (
+    build_assignment_email,
+    build_agent_assigned_email,
+    build_escalation_agent_reassignment_email,
+    send_notification_task,
+)
 from src.core.exceptions.base_exception import (
     ConflictException, ForbiddenException, NotFoundException,
 )
@@ -201,7 +206,7 @@ class AssignmentService:
             },
         )
 
-        await self._send_assignment_notifications(ticket, data.new_agent_id)
+        await self._send_assignment_notifications(ticket, data.new_agent_id, is_escalation=True)
         logger.info(
             f"Escalated ticket {ticket.ticket_number} reassigned: "
             f"old_agent={escalation.old_agent_id} → new_agent={data.new_agent_id} | "
@@ -211,30 +216,81 @@ class AssignmentService:
 
     # ── Shared notification helper ────────────────────────────────────────────
 
-    async def _send_assignment_notifications(self, ticket, agent_id: int) -> None:
+    async def _send_assignment_notifications(
+        self, ticket, agent_id: int, is_escalation: bool = False
+    ) -> None:
+        """
+        Fire email + in-app notifications after any assignment or reassignment.
+
+        Normal assignment  (is_escalation=False):
+          - Agent  : build_agent_assigned_email       + in-app ticket_assigned_agent
+          - Customer: build_assignment_email           + in-app ticket_assigned
+
+        Escalated reassignment (is_escalation=True):
+          - Agent  : build_escalation_agent_reassignment_email + in-app ticket_assigned_agent
+          - Customer: build_assignment_email (same copy)       + in-app ticket_assigned
+        """
+        severity = ticket.severity.value if hasattr(ticket.severity, "value") else str(ticket.severity)
+        priority = ticket.priority.value if hasattr(ticket.priority, "value") else str(ticket.priority)
+
+        # ── Agent notifications ───────────────────────────────────────────────
         agent_email = await self.user_repo.get_user_email(agent_id)
         if agent_email:
+            if is_escalation:
+                # Show response deadline if available
+                response_due_str = (
+                    ticket.escalated_response_due_at.strftime("%Y-%m-%d %H:%M UTC")
+                    if ticket.escalated_response_due_at else None
+                )
+                agent_payload = build_escalation_agent_reassignment_email(
+                    to_email        = agent_email,
+                    ticket_number   = ticket.ticket_number,
+                    ticket_title    = ticket.title,
+                    severity        = severity,
+                    priority        = priority,
+                    current_status  = ticket.status.value,
+                    response_due_at = response_due_str,
+                )
+                notification_type = "escalation_agent"
+            else:
+                agent_payload = build_agent_assigned_email(
+                    to_email      = agent_email,
+                    ticket_number = ticket.ticket_number,
+                    ticket_title  = ticket.title,
+                    severity      = severity,
+                    priority      = priority,
+                )
+                notification_type = "assignment_agent"
+
             send_notification_task.delay(
-                **vars(build_assignment_email(
-                    to_email=agent_email,
-                    ticket_number=ticket.ticket_number,
-                    ticket_title=ticket.title,
-                )),
-                ticket_number=ticket.ticket_number,
-                notification_type="assignment",
+                **vars(agent_payload),
+                ticket_number     = ticket.ticket_number,
+                notification_type = notification_type,
             )
+
+        # ── Agent in-app ──────────────────────────────────────────────────────
+        await self.notif_svc.ticket_assigned_agent(
+            recipient_id  = agent_id,
+            ticket_id     = ticket.id,
+            ticket_number = ticket.ticket_number,
+            ticket_title  = ticket.title,
+        )
+
+        # ── Customer email ────────────────────────────────────────────────────
         send_notification_task.delay(
             **vars(build_assignment_email(
-                to_email=ticket.customer_email,
-                ticket_number=ticket.ticket_number,
-                ticket_title=ticket.title,
+                to_email      = ticket.customer_email,
+                ticket_number = ticket.ticket_number,
+                ticket_title  = ticket.title,
             )),
-            ticket_number=ticket.ticket_number,
-            notification_type="assignment",
+            ticket_number     = ticket.ticket_number,
+            notification_type = "assignment_customer",
         )
+
+        # ── Customer in-app ───────────────────────────────────────────────────
         await self.notif_svc.ticket_assigned(
-            recipient_id=ticket.customer_id,
-            ticket_id=ticket.id,
-            ticket_number=ticket.ticket_number,
-            ticket_title=ticket.title,
+            recipient_id  = ticket.customer_id,
+            ticket_id     = ticket.id,
+            ticket_number = ticket.ticket_number,
+            ticket_title  = ticket.title,
         )

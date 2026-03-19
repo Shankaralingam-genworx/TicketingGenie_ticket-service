@@ -1,18 +1,6 @@
-"""Async PostgreSQL database client using SQLAlchemy.
-
-Used by the Ticket Service. Both Auth Service and Ticket Service share the same database.
-Tables are created via Base.metadata.create_all — each service creates only its own tables on startup.
-The SQL migration files (V1, V2) are kept as a reference/documentation only.
-
- Run Auth Service startup FIRST so that auth tables (users, teams, roles, etc.)
-    exist before ticket service tables try to create FK references to them.
-"""
-
-from typing import AsyncGenerator
-
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.orm import DeclarativeBase
-
+from typing import AsyncGenerator
 from src.config.settings import settings
 
 engine = create_async_engine(

@@ -1,11 +1,10 @@
 """Global error handler middleware."""
 
-import logging
-
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
-
+import logging
 from src.core.exceptions.base_exception import AppException
+
 
 logger = logging.getLogger("ticket.errors")
 
