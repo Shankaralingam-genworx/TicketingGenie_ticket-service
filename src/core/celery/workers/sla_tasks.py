@@ -100,26 +100,58 @@ async def _run_sla_check() -> dict:
             audit_repo      = TicketAuditRepository(session)
             escalation_repo = EscalationRepository(session)
 
+            # ── Diagnostic: log all active tickets and their SLA state ─────────
+            # Uses ORM query (not raw SQL) to avoid enum cast issues with asyncpg.
+            diag_result = await session.execute(
+                select(Ticket).where(
+                    Ticket.status.in_(ACTIVE)
+                ).order_by(Ticket.id.desc()).limit(20)
+            )
+            diag_rows = diag_result.scalars().all()
+            logger.info(f"[sla_monitor] Diagnostic — active tickets: {len(diag_rows)}")
+            for r in diag_rows:
+                logger.info(
+                    f"  ticket={r.ticket_number} status={r.status} "
+                    f"is_escalated={r.is_escalated} "
+                    f"agent={r.assigned_agent_id} "
+                    f"work_started={r.work_started_at} "
+                    f"first_resp={r.first_response_at} "
+                    f"resp_due={r.response_due_at} "
+                    f"resol_due={r.resolution_due_at} "
+                    f"now={now.isoformat()} "
+                    f"resp_breached={r.response_due_at is not None and r.response_due_at <= now} "
+                    f"resol_breached={r.resolution_due_at is not None and r.resolution_due_at <= now}"
+                )
+
             # ── Q1: Normal response breach ────────────────────────────────────
-            # Agent assigned but never clicked Start Working within response window
+            # Covers two sub-cases:
+            #   Q1a — agent was assigned but never clicked Start Working in time
+            #   Q1b — ticket was never even assigned (lead didn't act in time)
+            # Both result in escalation so the team lead must take action.
             r1 = await session.execute(
                 select(Ticket).where(
                     Ticket.is_escalated == False,               # noqa: E712
                     Ticket.response_due_at.is_not(None),
                     Ticket.response_due_at <= now,
                     Ticket.first_response_at.is_(None),         # never responded
-                    Ticket.assigned_agent_id.is_not(None),
                     Ticket.status.in_(ACTIVE),
+                    # NOTE: intentionally no filter on assigned_agent_id —
+                    # unassigned tickets that breach response SLA also escalate.
                 )
             )
             for ticket in r1.scalars().all():
+                breach_note = (
+                    f"Agent did not start working within response window. "
+                    f"response_due_at={ticket.response_due_at.isoformat()}"
+                    if ticket.assigned_agent_id
+                    else
+                    f"Ticket was never assigned within response window. "
+                    f"response_due_at={ticket.response_due_at.isoformat()}"
+                )
                 ok = await _escalate_ticket(
                     ticket=ticket, now=now,
                     reason="response_sla_breach",
-                    notes=(
-                        f"Agent did not start working within response window. "
-                        f"response_due_at={ticket.response_due_at.isoformat()}"
-                    ),
+                    notes=breach_note,
                     ticket_repo=ticket_repo,
                     audit_repo=audit_repo,
                     escalation_repo=escalation_repo,
@@ -130,6 +162,7 @@ async def _run_sla_check() -> dict:
                         ticket_id=ticket.id, ticket_number=ticket.ticket_number,
                         ticket_title=ticket.title, breach_type="response",
                         severity=_ev(ticket.severity), priority=_ev(ticket.priority),
+                        customer_id=ticket.customer_id,
                         customer_email=ticket.customer_email,
                         team_id=ticket.team_id,
                         assigned_agent_id=ticket.assigned_agent_id,
@@ -137,14 +170,16 @@ async def _run_sla_check() -> dict:
                     )
 
             # ── Q2: Normal resolution breach ──────────────────────────────────
-            # Agent started but didn't resolve in time
+            # Agent clicked Start Working but didn't resolve within resolution window.
+            # work_started_at IS NOT NULL is the single condition that confirms the
+            # agent started — first_response_at check is redundant and removed to
+            # avoid missed escalations.
             r2 = await session.execute(
                 select(Ticket).where(
                     Ticket.is_escalated == False,               # noqa: E712
                     Ticket.work_started_at.is_not(None),
                     Ticket.resolution_due_at.is_not(None),
                     Ticket.resolution_due_at <= now,
-                    Ticket.first_response_at.is_not(None),
                     Ticket.assigned_agent_id.is_not(None),
                     Ticket.status.in_(ACTIVE),
                 )
@@ -168,6 +203,7 @@ async def _run_sla_check() -> dict:
                         ticket_id=ticket.id, ticket_number=ticket.ticket_number,
                         ticket_title=ticket.title, breach_type="resolution",
                         severity=_ev(ticket.severity), priority=_ev(ticket.priority),
+                        customer_id=ticket.customer_id,
                         customer_email=ticket.customer_email,
                         team_id=ticket.team_id,
                         assigned_agent_id=ticket.assigned_agent_id,
@@ -189,7 +225,27 @@ async def _run_sla_check() -> dict:
                 )
             )
             for ticket in r3.scalars().all():
-                # Only notify — no new escalation row (max 1 per ticket)
+                # Guard: only notify ONCE — check if we already logged this breach type
+                # for this ticket. If a SLA_BREACHED audit entry with
+                # breach_type="escalated_response_sla_breach" exists, skip entirely.
+                from sqlalchemy import text as _text2
+                already = await session.execute(
+                    _text2(
+                        "SELECT id FROM ticket_audits "
+                        "WHERE ticket_id = :tid "
+                        "  AND action = 'sla_breached' "
+                        "  AND new_value->>'breach_type' = 'escalated_response_sla_breach' "
+                        "LIMIT 1"
+                    ),
+                    {"tid": ticket.id},
+                )
+                if already.fetchone():
+                    logger.info(
+                        f"[sla_monitor] Q3 already notified for {ticket.ticket_number} — skipping"
+                    )
+                    continue
+
+                # First time — log audit entry and fire notification
                 await audit_repo.log(
                     ticket_id=ticket.id,
                     action=_AuditAction().SLA_BREACHED,
@@ -198,7 +254,7 @@ async def _run_sla_check() -> dict:
                     new_value={
                         "breach_type":               "escalated_response_sla_breach",
                         "escalated_response_due_at": ticket.escalated_response_due_at.isoformat(),
-                        "checked_at":                now.isoformat(),
+                        "notified_at":               now.isoformat(),
                     },
                 )
                 counts["escalated_response_breaches"] += 1
@@ -206,14 +262,15 @@ async def _run_sla_check() -> dict:
                     ticket_id=ticket.id, ticket_number=ticket.ticket_number,
                     ticket_title=ticket.title, breach_type="escalated_response",
                     severity=_ev(ticket.severity), priority=_ev(ticket.priority),
+                    customer_id=ticket.customer_id,
                     customer_email=ticket.customer_email,
                     team_id=ticket.team_id,
                     assigned_agent_id=ticket.assigned_agent_id,
                     breached_at_iso=now.isoformat(),
                 )
                 logger.warning(
-                    f"[sla_monitor] Escalated response breach: {ticket.ticket_number} | "
-                    f"new_agent={ticket.assigned_agent_id}"
+                    f"[sla_monitor] Escalated response breach (first notification): "
+                    f"{ticket.ticket_number} | new_agent={ticket.assigned_agent_id}"
                 )
 
             # ── Q4: Escalated resolution breach ───────────────────────────────
@@ -231,6 +288,25 @@ async def _run_sla_check() -> dict:
                 )
             )
             for ticket in r4.scalars().all():
+                # Guard: only notify ONCE — same pattern as Q3
+                from sqlalchemy import text as _text3
+                already4 = await session.execute(
+                    _text3(
+                        "SELECT id FROM ticket_audits "
+                        "WHERE ticket_id = :tid "
+                        "  AND action = 'sla_breached' "
+                        "  AND new_value->>'breach_type' = 'escalated_resolution_sla_breach' "
+                        "LIMIT 1"
+                    ),
+                    {"tid": ticket.id},
+                )
+                if already4.fetchone():
+                    logger.info(
+                        f"[sla_monitor] Q4 already notified for {ticket.ticket_number} — skipping"
+                    )
+                    continue
+
+                # First time — log and notify
                 await audit_repo.log(
                     ticket_id=ticket.id,
                     action=_AuditAction().SLA_BREACHED,
@@ -239,7 +315,7 @@ async def _run_sla_check() -> dict:
                     new_value={
                         "breach_type":                  "escalated_resolution_sla_breach",
                         "escalated_resolution_due_at":  ticket.escalated_resolution_due_at.isoformat(),
-                        "checked_at":                   now.isoformat(),
+                        "notified_at":                  now.isoformat(),
                     },
                 )
                 counts["escalated_resolution_breaches"] += 1
@@ -247,14 +323,15 @@ async def _run_sla_check() -> dict:
                     ticket_id=ticket.id, ticket_number=ticket.ticket_number,
                     ticket_title=ticket.title, breach_type="escalated_resolution",
                     severity=_ev(ticket.severity), priority=_ev(ticket.priority),
+                    customer_id=ticket.customer_id,
                     customer_email=ticket.customer_email,
                     team_id=ticket.team_id,
                     assigned_agent_id=ticket.assigned_agent_id,
                     breached_at_iso=now.isoformat(),
                 )
                 logger.warning(
-                    f"[sla_monitor] Escalated resolution breach: {ticket.ticket_number} | "
-                    f"new_agent={ticket.assigned_agent_id}"
+                    f"[sla_monitor] Escalated resolution breach (first notification): "
+                    f"{ticket.ticket_number} | new_agent={ticket.assigned_agent_id}"
                 )
 
             await session.commit()
@@ -272,10 +349,27 @@ async def _run_sla_check() -> dict:
 async def _escalate_ticket(*, ticket, now, reason, notes,
                             ticket_repo, audit_repo, escalation_repo) -> bool:
     from src.constants.sla_constants import AuditAction
+    from src.data.models.postgres.escalation_model import Escalation
+    from sqlalchemy import select as _select
+
     try:
+        # Guard: skip if escalation row already exists (unique constraint on ticket_id).
+        # This prevents a crash on the next Celery scan after a partial failure.
+        existing = await escalation_repo.get_by_ticket(ticket.id)
+        if existing:
+            logger.warning(
+                f"[sla_monitor] Escalation row already exists for {ticket.ticket_number} "
+                f"(id={ticket.id}) — marking ticket is_escalated=True and skipping row create."
+            )
+            await ticket_repo.update(ticket, is_escalated=True, escalated_at=now)
+            return False  # don't double-notify
+
         await escalation_repo.create(
-            ticket_id=ticket.id, old_agent_id=ticket.assigned_agent_id,
-            reason=reason, escalated_by="system", notes=notes,
+            ticket_id    = ticket.id,
+            old_agent_id = ticket.assigned_agent_id or 0,   # 0 = unassigned
+            reason       = reason,
+            escalated_by = "system",
+            notes        = notes,
         )
         await ticket_repo.update(ticket, is_escalated=True, escalated_at=now)
         await audit_repo.log(
@@ -283,8 +377,10 @@ async def _escalate_ticket(*, ticket, now, reason, notes,
             actor_id=0, actor_role="system",
             old_value={"is_escalated": False},
             new_value={
-                "is_escalated": True, "old_agent_id": ticket.assigned_agent_id,
-                "escalated_at": now.isoformat(), "reason": reason,
+                "is_escalated": True,
+                "old_agent_id": ticket.assigned_agent_id,
+                "escalated_at": now.isoformat(),
+                "reason":       reason,
             },
         )
         logger.info(
@@ -293,7 +389,11 @@ async def _escalate_ticket(*, ticket, now, reason, notes,
         )
         return True
     except Exception as exc:
-        logger.error(f"[sla_monitor] Failed to escalate id={ticket.id}: {exc}", exc_info=True)
+        logger.error(
+            f"[sla_monitor] Failed to escalate ticket={ticket.ticket_number} "
+            f"id={ticket.id}: {exc}",
+            exc_info=True,
+        )
         return False
 
 
@@ -319,7 +419,7 @@ class _AuditAction:
 )
 def _notify_sla_breach(
     self, *, ticket_id, ticket_number, ticket_title, breach_type,
-    severity, priority, customer_email, team_id, assigned_agent_id, breached_at_iso,
+    severity, priority, customer_id, customer_email, team_id, assigned_agent_id, breached_at_iso,
 ) -> None:
     loop = asyncio.new_event_loop()
     try:
@@ -327,7 +427,8 @@ def _notify_sla_breach(
             ticket_id=ticket_id, ticket_number=ticket_number,
             ticket_title=ticket_title, breach_type=breach_type,
             severity=severity, priority=priority,
-            customer_email=customer_email, team_id=team_id,
+            customer_id=customer_id, customer_email=customer_email,
+            team_id=team_id,
             assigned_agent_id=assigned_agent_id, breached_at_iso=breached_at_iso,
         ))
     except Exception as exc:
@@ -339,56 +440,115 @@ def _notify_sla_breach(
 
 async def _send_breach_notifications(
     *, ticket_id, ticket_number, ticket_title, breach_type,
-    severity, priority, customer_email, team_id,
+    severity, priority, customer_id, customer_email, team_id,
     assigned_agent_id, breached_at_iso,
 ) -> None:
-    import httpx
     from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
     from sqlalchemy.orm import sessionmaker
     from src.config.settings import settings
-    from src.core.celery.workers.email_tasks import build_sla_breach_email, send_notification_task
+    from src.core.celery.workers.email_tasks import (
+        build_sla_breach_email,
+        build_escalation_customer_notice_email,
+        build_sla_breach_customer_email,
+        send_notification_task,
+    )
     from src.core.services.notification_service import NotificationService
+    from src.data.repositories.shared_user_repository import SharedUserRepository
 
     breached_at       = datetime.fromisoformat(breached_at_iso)
     breached_at_label = breached_at.strftime("%Y-%m-%d %H:%M UTC")
 
+    # ── Resolve team lead from shared DB (no HTTP call) ───────────────────────
     lead_email, lead_name, lead_id = "support-lead@company.com", "Team Lead", 0
-    if team_id:
-        try:
-            async with httpx.AsyncClient(timeout=5.0) as client:
-                resp = await client.get(
-                    f"{settings.AUTH_SERVICE_URL}/api/v1/teams/{team_id}/lead"
-                )
-                if resp.status_code == 200:
-                    d = resp.json()
-                    lead_email = d.get("email", lead_email)
-                    lead_name  = d.get("name",  lead_name)
-                    lead_id    = d.get("id",     lead_id)
-        except Exception as e:
-            logger.warning(f"[sla_breach] Could not fetch lead: {e}")
-
-    payload = build_sla_breach_email(
-        to_email=lead_email, lead_name=lead_name,
-        ticket_number=ticket_number, ticket_title=ticket_title, severity=severity, priority=priority,
-        customer_email=customer_email, breached_at=breached_at_label,
-        assigned_agent_id=assigned_agent_id,
-    )
-    send_notification_task.delay(
-        to_email=payload.to_email, subject=payload.subject,
-        html_body=payload.html_body, text_body=payload.text_body,
-        ticket_number=ticket_number,
-        notification_type=f"sla_{breach_type}_breach",
-    )
-
-    engine = create_async_engine(settings.DATABASE_URL, echo=False)
+    engine            = create_async_engine(settings.DATABASE_URL, echo=False)
     AsyncSessionLocal = sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
+
     try:
         async with AsyncSessionLocal() as session:
-            async with session.begin():
-                await NotificationService(session).sla_breached(
-                    recipient_id=lead_id, ticket_id=ticket_id,
-                    ticket_number=ticket_number, ticket_title=ticket_title,
-                    severity=severity, priority=priority, breached_at=breached_at,
+            if team_id:
+                lead = await SharedUserRepository(session).get_team_lead_by_team_id(team_id)
+                if lead:
+                    lead_email = lead["email"]
+                    lead_name  = lead["name"]
+                    lead_id    = lead["id"]
+                else:
+                    logger.warning(
+                        f"[sla_breach] No active lead for team_id={team_id} | "
+                        f"ticket={ticket_number} — using fallback"
+                    )
+
+            # ── Email to team lead ────────────────────────────────────────────
+            payload = build_sla_breach_email(
+                to_email=lead_email, lead_name=lead_name,
+                ticket_number=ticket_number, ticket_title=ticket_title,
+                severity=severity, priority=priority,
+                customer_email=customer_email, breached_at=breached_at_label,
+                assigned_agent_id=assigned_agent_id,
+            )
+            send_notification_task.delay(
+                to_email=payload.to_email, subject=payload.subject,
+                html_body=payload.html_body, text_body=payload.text_body,
+                ticket_number=ticket_number,
+                notification_type=f"sla_{breach_type}_breach_lead",
+            )
+
+            # ── In-app for team lead ──────────────────────────────────────────
+            # Do NOT call session.begin() here — AsyncSession auto-starts a transaction
+            # on first use. Calling begin() again raises "A transaction is already begun".
+            # Just call the service methods directly and commit once at the end.
+            await NotificationService(session).sla_breached(
+                recipient_id=lead_id, ticket_id=ticket_id,
+                ticket_number=ticket_number, ticket_title=ticket_title,
+                severity=severity, priority=priority, breached_at=breached_at,
+            )
+
+            # ── Customer notifications (email + in-app) ───────────────────────
+            # Q1/Q2 (first breach): reassuring "still working on it" message
+            # Q3/Q4 (second breach on escalated ticket): apology update
+            is_second_breach = breach_type in ("escalated_response", "escalated_resolution")
+
+            if is_second_breach:
+                cust_payload = build_sla_breach_customer_email(
+                    to_email        = customer_email,
+                    ticket_number   = ticket_number,
+                    ticket_title    = ticket_title,
+                    current_status  = "in_progress",
+                    is_second_breach= True,
                 )
+            else:
+                cust_payload = build_escalation_customer_notice_email(
+                    to_email       = customer_email,
+                    ticket_number  = ticket_number,
+                    ticket_title   = ticket_title,
+                    current_status = "in_progress",
+                )
+
+            send_notification_task.delay(
+                to_email=cust_payload.to_email, subject=cust_payload.subject,
+                html_body=cust_payload.html_body, text_body=cust_payload.text_body,
+                ticket_number=ticket_number,
+                notification_type=f"sla_{breach_type}_breach_customer",
+            )
+
+            # ── In-app for customer ───────────────────────────────────────────
+            if is_second_breach:
+                await NotificationService(session).sla_breached_customer(
+                    recipient_id  = customer_id,
+                    ticket_id     = ticket_id,
+                    ticket_number = ticket_number,
+                    ticket_title  = ticket_title,
+                )
+            else:
+                await NotificationService(session).ticket_escalated_customer(
+                    recipient_id   = customer_id,
+                    ticket_id      = ticket_id,
+                    ticket_number  = ticket_number,
+                    ticket_title   = ticket_title,
+                    current_status = "in_progress",
+                )
+
+            # Single commit covers all in-app notifications written above
+            await session.commit()
+
     finally:
         await engine.dispose()

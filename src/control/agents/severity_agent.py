@@ -1,20 +1,14 @@
-"""
-Deterministic severity detection agent using keyword heuristics and
-weighted scoring rules — no LLM or external API calls required.
-
-Scoring logic:
-  - Each matched keyword contributes a weight to its severity bucket.
-  - The bucket with the highest total score wins.
-  - Tie-breaking favours higher severity (critical > high > medium > low).
-  - Falls back to LOW if nothing matches.
-"""
-
 import logging
 import re
 
+from sqlalchemy.ext.asyncio import AsyncSession
+
 from src.constants.sla_constants import Severity
+from src.data.repositories.severity_keyword_repository import SeverityKeywordRepository
 
 logger = logging.getLogger("ticket.severity_agent")
+
+_PRIORITY_ORDER = [Severity.CRITICAL, Severity.HIGH, Severity.MEDIUM, Severity.LOW]
 
 
 # ---------------------------------------------------------------------------
@@ -331,88 +325,64 @@ _LOW_KW: dict[str, float] = {
     "no impact": 2.0,
 }
 
-# Map severity level → (keyword dict, Severity enum)
-_SEVERITY_BUCKETS: list[tuple[dict[str, float], Severity]] = [
-    (_CRITICAL_KW, Severity.CRITICAL),
-    (_HIGH_KW,     Severity.HIGH),
-    (_MEDIUM_KW,   Severity.MEDIUM),
-    (_LOW_KW,      Severity.LOW),
-]
-
-
 class SeverityAgent:
     """
-    Determines ticket severity using weighted keyword scoring.
+    Determines ticket severity using weighted keyword scoring loaded from DB.
 
-    Scoring:
-      - The combined title + description text is searched for each keyword.
-      - Matched weights are summed per severity bucket.
-      - The bucket with the highest score wins; ties break toward higher severity.
-      - Returns LOW when nothing matches.
+    Keywords are fetched from the `severity_keywords` table on every call so
+    that admin changes take effect immediately without a restart.
 
-    Usage (sync or async — no I/O involved):
-        agent = SeverityAgent()
+    Usage:
+        agent = SeverityAgent(db)
         severity = await agent.detect(issue_name, title, description)
-        # or synchronously:
-        severity = agent.detect_sync(issue_name, title, description)
     """
 
-    # ------------------------------------------------------------------
-    # Public API
-    # ------------------------------------------------------------------
+    def __init__(self, db: AsyncSession):
+        self.db = db
 
     async def detect(
         self, issue_name: str, title: str, description: str
     ) -> Severity:
-        """Async wrapper around the synchronous scoring logic."""
-        return self.detect_sync(issue_name, title, description)
-
-    def detect_sync(
-        self, issue_name: str, title: str, description: str
-    ) -> Severity:
         """
-        Classify severity from issue_name, title, and description.
+        Load active keywords from DB and score the ticket text.
         Title is double-weighted as it carries a stronger signal.
         """
-        # Title gets 2× weight as it is the most concentrated signal.
+        buckets = await SeverityKeywordRepository(self.db).get_all_active_as_dict()
+
+        # Title gets 2× weight — most concentrated signal.
         combined = f"{issue_name} {title} {title} {description}".lower()
         # Normalise punctuation so "not-working" == "not working"
         combined = re.sub(r"[_\-/\\]", " ", combined)
 
-        scores: dict[Severity, float] = {s: 0.0 for _, s in _SEVERITY_BUCKETS}
+        scores: dict[Severity, float] = {s: 0.0 for s in Severity}
 
-        for kw_dict, severity in _SEVERITY_BUCKETS:
+        for severity, kw_dict in buckets.items():
             for phrase, weight in kw_dict.items():
                 if phrase in combined:
                     scores[severity] += weight
 
-        best_severity = self._resolve(scores)
+        best = _resolve(scores)
         logger.info(
-            f"Keyword severity='{best_severity.value}' | "
-            f"scores={dict(scores)} | title={title!r}"
+            f"Keyword severity='{best.value}' | scores={dict(scores)} | title={title!r}"
         )
-        return best_severity
+        return best
 
-    # ------------------------------------------------------------------
-    # Private helpers
-    # ------------------------------------------------------------------
 
-    @staticmethod
-    def _resolve(scores: dict[Severity, float]) -> Severity:
-        """
-        Return the severity with the highest score.
-        Ties are broken by priority order: CRITICAL > HIGH > MEDIUM > LOW.
-        Falls back to LOW when all scores are zero.
-        """
-        priority_order = [Severity.CRITICAL, Severity.HIGH, Severity.MEDIUM, Severity.LOW]
+def _resolve(scores: dict[Severity, float]) -> Severity:
+    """
+    Return the severity with the highest score.
+    Ties break by priority: CRITICAL > HIGH > MEDIUM > LOW.
+    Falls back to LOW when all scores are zero.
+    """
+    if all(v == 0.0 for v in scores.values()):
+        return Severity.LOW
 
-        if all(v == 0.0 for v in scores.values()):
-            return Severity.LOW
+    max_score = max(scores.values())
+    for severity in _PRIORITY_ORDER:
+        if scores[severity] == max_score:
+            return severity
 
-        max_score = max(scores.values())
-        # Among all buckets that share the max score, pick the most severe.
-        for severity in priority_order:
-            if scores[severity] == max_score:
-                return severity
+    return Severity.LOW
 
-        return Severity.LOW  # unreachable, but satisfies type checkers
+
+    

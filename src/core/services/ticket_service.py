@@ -9,7 +9,6 @@ import logging
 import random
 import string
 from datetime import datetime, timezone
-from pathlib import Path
 from typing import List, Optional
 
 from fastapi import UploadFile
@@ -19,9 +18,11 @@ from src.core.celery.workers.email_tasks import (
     build_status_update_email,
     send_notification_task,
     send_ticket_acknowledgement_task,
+    notify_team_lead_new_ticket_task,
 )
+from src.core.services.notification_service import NotificationService
 from src.constants.priority_constants import SEVERITY_TO_PRIORITY, Priority
-from src.constants.sla_constants import AuditAction, CustomerTier, Severity
+from src.constants.sla_constants import AuditAction, Severity
 from src.constants.ticket_constants import (
     TicketSource,
     TicketStatus,
@@ -39,7 +40,7 @@ from src.data.repositories.issue_resolver_repository import IssueResolverReposit
 from src.data.repositories.sla_repository import SLARepository
 from src.data.repositories.ticket_audit_repository import TicketAuditRepository
 from src.data.repositories.ticket_repository import TicketRepository
-from src.schemas.attachment_schema import AttachmentMeta, UploadValidationError, validate_upload  # noqa: F401
+from src.utils.gcs_utils import _inject_signed_urls, upload_images, TICKET_PREFIX
 from src.schemas.ticket_filter_schema import TicketFilterParams
 from src.schemas.ticket_schema import (
     AgentStatusCount,
@@ -50,41 +51,13 @@ from src.schemas.ticket_schema import (
 from src.utils.sla_utils import compute_due_at
 
 logger = logging.getLogger("ticket.service")
-UPLOAD_DIR = Path("uploads/tickets")
 
 
-# ── Attachment helpers (unchanged) ────────────────────────────────────────────
+# ── Attachment helpers ────────────────────────────────────────────────────────
 
 async def _process_attachments(attachments: Optional[List[UploadFile]]) -> list[dict]:
-    if not attachments:
-        return []
-    UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
-    results = []
-    for file in attachments:
-        data       = await file.read()
-        size_bytes = len(data)
-        try:
-            validate_upload(file.filename or "upload", file.content_type, size_bytes)
-        except UploadValidationError as exc:
-            logger.warning(f"[attachment] Skipped '{file.filename}' — {exc}")
-            continue
-        original_name = file.filename or "upload"
-        ext         = original_name.rsplit(".", 1)[-1].lower() if "." in original_name else "bin"
-        stored_name = f"{uuid.uuid4()}.{ext}"
-        file_path   = UPLOAD_DIR / stored_name
-        with open(file_path, "wb") as buf:
-            buf.write(data)
-        rel_path = str(file_path)
-        results.append({
-            "original_name": original_name,
-            "stored_name":   stored_name,
-            "content_type":  file.content_type,
-            "size_bytes":    size_bytes,
-            "path":          rel_path,
-            "url":           f"/{rel_path}",
-        })
-        logger.info(f"[attachment] Saved '{original_name}' → '{stored_name}' ({size_bytes} bytes)")
-    return results
+    """Validate and upload ticket attachments to GCS. Images only."""
+    return await upload_images(attachments, prefix=TICKET_PREFIX)
 
 
 def _generate_ticket_number() -> str:
@@ -103,7 +76,7 @@ class TicketService:
         self.sla_repo       = SLARepository(db)
         self.resolver_repo  = IssueResolverRepository(db)
         self.audit_repo     = TicketAuditRepository(db)
-        self.severity_agent = SeverityAgent()
+        self.severity_agent = SeverityAgent(db)
 
     # ── REQ-1: Create — auto-acknowledge after ack email queued ───────────────
 
@@ -117,7 +90,10 @@ class TicketService:
         attachments:  List[UploadFile] = None,
     ) -> TicketResponse:
         customer_id   = current_user["user_id"]
-        customer_tier = CustomerTier(current_user.get("customer_tier") or CustomerTier.SMB)
+
+        customer_tier = (current_user.get("customer_tier") or "smb").lower()
+        
+        org_id        = current_user.get("org_id")
 
         issue = await self.issue_repo.get_by_id(issue_id)
         if not issue:
@@ -129,7 +105,7 @@ class TicketService:
         logger.info(f"Severity detected: {severity} | customer={customer_id}")
 
         # Enterprise tier gets a severity bump
-        if customer_tier == CustomerTier.ENTERPRISE:
+        if customer_tier == "enterprise":
             if severity == Severity.HIGH:     severity = Severity.CRITICAL
             elif severity == Severity.MEDIUM: severity = Severity.HIGH
             elif severity == Severity.LOW:    severity = Severity.MEDIUM
@@ -170,6 +146,7 @@ class TicketService:
             customer_id                     = customer_id,
             customer_email                  = current_user.get("email", ""),
             customer_tier                   = customer_tier,
+            org_id                          = org_id,
             issue_id                        = issue_id,
             customer_priority               = customer_priority,
             priority                        = system_priority,
@@ -212,6 +189,31 @@ class TicketService:
             sla_resolution_hrs= sla_resolution_hrs,
         )
 
+        # ── In-app notification: customer — ticket received ───────────────────
+        await NotificationService(self.db).ticket_created(
+            recipient_id  = customer_id,
+            ticket_id     = ticket.id,
+            ticket_number = ticket.ticket_number,
+            ticket_title  = ticket.title,
+        )
+
+        # ── Email + in-app: team lead — new ticket in their queue ─────────────
+        # Only fired when the ticket was routed to a team.
+        if team_id:
+            notify_team_lead_new_ticket_task.delay(
+                ticket_id           = ticket.id,
+                ticket_number       = ticket.ticket_number,
+                ticket_title        = ticket.title,
+                severity            = str(severity),
+                priority            = str(system_priority),
+                customer_email      = ticket.customer_email,
+                customer_id         = customer_id,
+                team_id             = team_id,
+                priority_overridden = priority_overridden,
+                original_priority   = customer_priority.value,
+                system_priority     = system_priority.value,
+            )
+
         # REQ-1: Immediately move to ACKNOWLEDGED so team lead queue shows correct status.
         # The email is already enqueued above; this just keeps the DB in sync.
         ticket = await self.ticket_repo.update(ticket, status=TicketStatus.ACKNOWLEDGED)
@@ -222,7 +224,7 @@ class TicketService:
             new_value={"status": TicketStatus.ACKNOWLEDGED.value},
         )
 
-        return TicketResponse.model_validate(ticket)
+        return _inject_signed_urls(TicketResponse.model_validate(ticket))
 
     # ── Read ──────────────────────────────────────────────────────────────────
 
@@ -234,7 +236,6 @@ class TicketService:
         requester_team_id: int | None = None,
     ) -> TicketResponse:
         ticket = await self.ticket_repo.get_by_id(ticket_id)
-        print(requester_role)
         if not ticket:
             raise NotFoundException("Ticket", ticket_id)
 
@@ -252,21 +253,26 @@ class TicketService:
             if ticket.team_id != requester_team_id:
                 raise ForbiddenException("You can only view tickets for your team.")
 
-        return TicketResponse.model_validate(ticket)
+        return _inject_signed_urls(TicketResponse.model_validate(ticket))
 
     async def get_my_tickets(self, customer_id: int) -> list[TicketResponse]:
-        return [TicketResponse.model_validate(t)
-                for t in await self.ticket_repo.get_by_customer(customer_id)]
+        return [
+        _inject_signed_urls(TicketResponse.model_validate(t))
+        for t in await self.ticket_repo.get_by_customer(customer_id)
+    ]
 
     async def get_agent_tickets(self, agent_id: int) -> list[TicketResponse]:
-        return [TicketResponse.model_validate(t)
-                for t in await self.ticket_repo.get_by_agent(agent_id)]
+        return [
+        _inject_signed_urls(TicketResponse.model_validate(t))
+        for t in await self.ticket_repo.get_by_agent(agent_id)
+    ]
 
     async def get_team_tickets(
         self, team_id: int, status: list[TicketStatus] | None = None
     ) -> list[TicketResponse]:
         tickets = await self.ticket_repo.get_by_team(team_id, status=status)
-        return [TicketResponse.model_validate(t) for t in tickets]
+        return [_inject_signed_urls(TicketResponse.model_validate(t)) for t in tickets]
+
 
     async def get_sla_dashboard(self, team_id: int) -> list[TicketResponse]:
         tickets = await self.ticket_repo.get_sla_watch(team_id)
@@ -390,7 +396,7 @@ class TicketService:
             },
         )
         logger.info(f"[start_working] {ticket.ticket_number} → OPEN | agent={agent_id}")
-        return TicketResponse.model_validate(ticket)
+        return _inject_signed_urls(TicketResponse.model_validate(ticket))
 
    
 
@@ -456,7 +462,18 @@ class TicketService:
             **vars(payload), ticket_number=ticket.ticket_number,
             notification_type="status_update",
         )
-        return TicketResponse.model_validate(ticket)
+
+        # ── In-app notification: customer — status changed ────────────────────
+        await NotificationService(self.db).status_changed(
+            recipient_id  = ticket.customer_id,
+            ticket_id     = ticket.id,
+            ticket_number = ticket.ticket_number,
+            ticket_title  = ticket.title,
+            old_status    = old_status.value,
+            new_status    = new_status.value,
+        )
+
+        return _inject_signed_urls(TicketResponse.model_validate(ticket))
 
     # ── Filtered listing (unchanged logic, deduped method) ───────────────────
 
@@ -467,7 +484,7 @@ class TicketService:
         total   = await self.ticket_repo.count_agent_tickets_filtered(agent_id, filters)
         pages   = math.ceil(total / filters.per_page) if filters.per_page else 1
         return PaginatedTicketResponse(
-            items=[TicketResponse.model_validate(t) for t in tickets],
+            items=[_inject_signed_urls(TicketResponse.model_validate(t)) for t in tickets],
             total=total, page=filters.page, per_page=filters.per_page, pages=pages,
         )
 
@@ -478,7 +495,7 @@ class TicketService:
         total   = await self.ticket_repo.count_team_queue_filtered(team_id, filters)
         pages   = math.ceil(total / filters.per_page) if filters.per_page else 1
         return PaginatedTicketResponse(
-            items=[TicketResponse.model_validate(t) for t in tickets],
+            items=[_inject_signed_urls(TicketResponse.model_validate(t)) for t in tickets],
             total=total, page=filters.page, per_page=filters.per_page, pages=pages,
         )
 
@@ -489,7 +506,27 @@ class TicketService:
         total   = await self.ticket_repo.count_team_tickets_filtered(team_id, filters)
         pages   = math.ceil(total / filters.per_page) if filters.per_page else 1
         return PaginatedTicketResponse(
-            items=[TicketResponse.model_validate(t) for t in tickets],
+            items=[_inject_signed_urls(TicketResponse.model_validate(t)) for t in tickets],
+            total=total, page=filters.page, per_page=filters.per_page, pages=pages,
+        )
+
+    async def get_org_tickets(
+        self,
+        org_id: int,
+        filters: TicketFilterParams,
+    ) -> PaginatedTicketResponse:
+        """
+        Return a paginated list of all tickets raised by customers
+        that belong to the given organisation.
+
+        Called by org_admin via GET /organisations/me/tickets.
+        org_id is taken from the JWT claim — never from user input.
+        """
+        tickets = await self.ticket_repo.get_by_org_filtered(org_id, filters)
+        total   = await self.ticket_repo.count_by_org_filtered(org_id, filters)
+        pages   = math.ceil(total / filters.per_page) if filters.per_page else 1
+        return PaginatedTicketResponse(
+            items=[_inject_signed_urls(TicketResponse.model_validate(t)) for t in tickets],
             total=total, page=filters.page, per_page=filters.per_page, pages=pages,
         )
 
@@ -515,7 +552,7 @@ class TicketService:
             tickets: list[TicketResponse] = []
             if include_tickets:
                 raw     = await self.ticket_repo.get_agent_tickets_filtered(aid, filters)
-                tickets = [TicketResponse.model_validate(t) for t in raw]
+                tickets = [_inject_signed_urls(TicketResponse.model_validate(t)) for t in raw]
             results.append(AgentWorkloadResponse(
                 agent_id=aid, agent_name=agent.get("name", ""),
                 agent_email=agent.get("email", ""), total=total_,
@@ -523,3 +560,5 @@ class TicketService:
             ))
         results.sort(key=lambda r: r.total, reverse=True)
         return results
+    
+    

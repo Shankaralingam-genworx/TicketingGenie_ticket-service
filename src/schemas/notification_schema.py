@@ -1,8 +1,4 @@
-"""
-Notification Pydantic schemas.
 
-File path: src/schemas/notification_schema.py
-"""
 
 from datetime import datetime
 from typing import List, Optional

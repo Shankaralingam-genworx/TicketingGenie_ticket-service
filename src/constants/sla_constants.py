@@ -1,20 +1,10 @@
-"""SLA-related enums.
-File: src/constants/sla_constants.py
-"""
-
 from enum import Enum
-
 
 class Severity(str, Enum):
     CRITICAL = "critical"
     HIGH     = "high"
     MEDIUM   = "medium"
     LOW      = "low"
-
-
-class CustomerTier(str, Enum):
-    ENTERPRISE = "enterprise"
-    SMB        = "smb"
 
 
 class CommentSource(str, Enum):
@@ -35,5 +25,5 @@ class AuditAction(str, Enum):
     REOPENED       = "reopened"
     EMAIL_SENT     = "email_sent"
     SLA_BREACHED   = "sla_breached"
-    WORK_STARTED   = "work_started"   # agent clicked "Start Working" — resolution SLA clock starts
-    UPDATED        = "updated"        # generic field update (e.g. first_response_at)
+    WORK_STARTED   = "work_started"   
+    UPDATED        = "updated"       

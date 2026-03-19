@@ -1,11 +1,11 @@
 """Entry point for the Ticket Service."""
 
 import logging
-import logging.config
 from contextlib import asynccontextmanager
 
 import uvicorn
 from fastapi import FastAPI
+from src.init_db import main as init_database       
 
 from src.data.clients.postgres_client import create_tables
 
@@ -30,6 +30,8 @@ async def lifespan(app: FastAPI):
 
     await create_tables()
     logger.info("Database tables created / verified.")
+
+    await init_database()
 
     logger.info("Ticket Service ready.")
     yield

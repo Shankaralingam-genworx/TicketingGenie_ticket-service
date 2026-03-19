@@ -1,30 +1,20 @@
-"""Ticket ORM model.
-File: src/data/models/postgres/ticket_model.py
-
-New columns for escalation SLA tracking:
-  escalated_response_due_at   — set when team lead reassigns escalated ticket.
-                                 New agent must click Start Working before this.
-  escalated_resolution_due_at — set when new agent clicks Start Working after
-                                 escalation. New agent must resolve before this.
-
-These are separate from response_due_at / resolution_due_at so the original
-SLA audit trail is never overwritten. The Celery monitor checks BOTH pairs:
-  Normal:     response_due_at / resolution_due_at    (is_escalated=False)
-  Escalated:  escalated_response_due_at / escalated_resolution_due_at (is_escalated=True)
-"""
-
 from datetime import datetime, timezone
 
 from sqlalchemy import (
-    Boolean, DateTime, Enum, ForeignKey, Integer, JSON, String, Text,
+    Boolean,
+    DateTime,
+    Enum,
+    ForeignKey,
+    Integer,
+    JSON,
+    String,
+    Text,
 )
 from sqlalchemy.orm import Mapped, mapped_column, relationship
-
 from src.constants.priority_constants import Priority
-from src.constants.sla_constants import CustomerTier, Severity
+from src.constants.sla_constants import Severity
 from src.constants.ticket_constants import TicketSource, TicketStatus
 from src.data.clients.postgres_client import Base
-
 
 class Ticket(Base):
     __tablename__ = "tickets"
@@ -34,11 +24,16 @@ class Ticket(Base):
     title:         Mapped[str] = mapped_column(String(255), nullable=False)
     description:   Mapped[str] = mapped_column(Text, nullable=False)
 
-    customer_id:    Mapped[int] = mapped_column(Integer, nullable=False, index=True)
-    customer_email: Mapped[str] = mapped_column(String, nullable=False)
-    customer_tier:  Mapped[CustomerTier] = mapped_column(
-        Enum(CustomerTier, name="customertier"), nullable=False
-    )
+    customer_id:    Mapped[int]      = mapped_column(Integer, nullable=False, index=True)
+    customer_email: Mapped[str]      = mapped_column(String, nullable=False)
+
+    # Tier name stored as plain string — sourced from auth service JWT claim.
+    # No longer an enum; tiers are managed in auth.customer_tiers table.
+    customer_tier:  Mapped[str]      = mapped_column(String(100), nullable=False)
+
+    # org_id mirrors auth.users.org_id — stored for filtering/reporting.
+    # NULL for customers without an organisation.
+    org_id: Mapped[int | None]       = mapped_column(Integer, nullable=True, index=True)
 
     issue_id: Mapped[int | None] = mapped_column(
         Integer, ForeignKey("issues.id", ondelete="SET NULL"), nullable=True

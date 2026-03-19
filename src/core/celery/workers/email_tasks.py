@@ -49,7 +49,7 @@ class EmailPayload:
     bind=True,
     max_retries=3,
     default_retry_delay=30,
-    queue="email",
+    queue="ticket_email",
 )
 def send_notification_task(
     self,
@@ -105,7 +105,7 @@ def send_notification_task(
     bind=True,
     max_retries=3,
     default_retry_delay=30,
-    queue="email",
+    queue="ticket_email",
 )
 def send_ticket_acknowledgement_task(
     self,
@@ -152,6 +152,122 @@ def send_ticket_acknowledgement_task(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Team-lead new-ticket notification task
+# ─────────────────────────────────────────────────────────────────────────────
+
+@celery_app.task(
+    name="src.core.celery.workers.email_tasks.notify_team_lead_new_ticket_task",
+    bind=True,
+    max_retries=3,
+    default_retry_delay=30,
+    queue="ticket_email",
+)
+def notify_team_lead_new_ticket_task(
+    self,
+    *,
+    ticket_id:           int,
+    ticket_number:       str,
+    ticket_title:        str,
+    severity:            str,
+    priority:            str,
+    customer_email:      str,
+    customer_id:         int,
+    team_id:             int,
+    priority_overridden: bool          = False,
+    original_priority:   Optional[str] = None,
+    system_priority:     Optional[str] = None,
+) -> None:
+    """
+    Fetches the team lead from the shared DB, then sends:
+      - Email to team lead notifying them of the new ticket
+      - In-app notification for team lead
+    Runs entirely in background so ticket creation stays instant.
+    """
+    try:
+        asyncio.run(_notify_team_lead_new_ticket(
+            ticket_id=ticket_id, ticket_number=ticket_number,
+            ticket_title=ticket_title, severity=severity,
+            priority=priority, customer_email=customer_email,
+            customer_id=customer_id, team_id=team_id,
+            priority_overridden=priority_overridden,
+            original_priority=original_priority,
+            system_priority=system_priority,
+        ))
+    except Exception as exc:
+        logger.error(
+            f"[team_lead_new_ticket] Failed | ticket={ticket_number} | "
+            f"attempt={self.request.retries + 1} | {exc}"
+        )
+        raise self.retry(exc=exc)
+
+
+async def _notify_team_lead_new_ticket(
+    *, ticket_id, ticket_number, ticket_title, severity, priority,
+    customer_email, customer_id, team_id, priority_overridden,
+    original_priority, system_priority,
+) -> None:
+    from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
+    from sqlalchemy.orm import sessionmaker
+    from src.config.settings import settings
+    from src.core.services.notification_service import NotificationService
+    from src.data.repositories.shared_user_repository import SharedUserRepository
+
+    engine            = create_async_engine(settings.DATABASE_URL, echo=False)
+    AsyncSessionLocal = sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
+
+    try:
+        async with AsyncSessionLocal() as session:
+            lead = await SharedUserRepository(session).get_team_lead_by_team_id(team_id)
+            if not lead:
+                logger.warning(
+                    f"[team_lead_new_ticket] No active lead found for team_id={team_id} "
+                    f"| ticket={ticket_number} — skipping"
+                )
+                return
+
+            # ── Email to team lead ────────────────────────────────────────────
+            payload = build_lead_ticket_created_email(
+                to_email=lead["email"],
+                lead_name=lead["name"],
+                ticket_number=ticket_number,
+                ticket_title=ticket_title,
+                severity=severity,
+                priority=priority,
+                customer_email=customer_email,
+                priority_overridden=priority_overridden,
+                original_priority=original_priority,
+                system_priority=system_priority,
+            )
+            EmailService().send_email(
+                to_email=payload.to_email,
+                subject=payload.subject,
+                html_body=payload.html_body,
+                text_body=payload.text_body,
+            )
+            logger.info(
+                f"[team_lead_new_ticket] Email sent → {lead['email']} | ticket={ticket_number}"
+            )
+
+            # ── In-app notification ───────────────────────────────────────────
+            async with session.begin():
+                await NotificationService(session).ticket_created_team_lead(
+                    recipient_id        = lead["id"],
+                    ticket_id           = ticket_id,
+                    ticket_number       = ticket_number,
+                    ticket_title        = ticket_title,
+                    severity            = severity,
+                    priority            = priority,
+                    priority_overridden = priority_overridden,
+                )
+            logger.info(
+                f"[team_lead_new_ticket] In-app sent → lead_id={lead['id']} | "
+                f"ticket={ticket_number}"
+            )
+    finally:
+        await engine.dispose()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # DB-only task — NEW → ACKNOWLEDGED
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -160,7 +276,7 @@ def send_ticket_acknowledgement_task(
     bind=True,
     max_retries=3,
     default_retry_delay=10,
-    queue="email",
+    queue="ticket_email",
 )
 def acknowledge_ticket_status_task(self, *, ticket_id: int) -> None:
     """Transitions ticket NEW → ACKNOWLEDGED in DB. Guard: skips if not NEW."""
@@ -571,6 +687,369 @@ def build_sla_breach_email(
     return EmailPayload(
         to_email=to_email,
         subject=f"🚨 SLA BREACH [{ticket_number}] — {ticket_title}",
+        html_body=html_body,
+        text_body=text_body,
+    )
+
+
+def build_lead_ticket_created_email(
+    *,
+    to_email:            str,
+    lead_name:           str,
+    ticket_number:       str,
+    ticket_title:        str,
+    severity:            str,
+    priority:            str,
+    customer_email:      str,
+    priority_overridden: bool          = False,
+    original_priority:   Optional[str] = None,
+    system_priority:     Optional[str] = None,
+) -> EmailPayload:
+    """Email to team lead when a new ticket is routed to their team."""
+    sev_colours = {
+        "critical": ("#FEF2F2", "#DC2626"), "high": ("#FFF7ED", "#D97706"),
+        "medium":   ("#FFFBEB", "#CA8A04"), "low":  ("#F0FDF4", "#16A34A"),
+    }
+    sev_bg, sev_col = sev_colours.get(severity.lower(), ("#F1F5F9", "#334155"))
+
+    override_html = override_text = ""
+    if priority_overridden and original_priority and system_priority:
+        override_html = f"""
+        <tr><td colspan="2" style="padding:0 0 16px;">
+          <div style="background:#FFF7ED;border:1px solid #FED7AA;
+                      border-radius:8px;padding:14px 18px;">
+            <p style="margin:0 0 6px;font-size:13px;font-weight:700;color:#C2410C;">
+              ⚠ Priority Auto-Adjusted
+            </p>
+            <p style="margin:0;font-size:13px;color:#7C2D12;line-height:1.6;">
+              Customer requested <strong>{original_priority.upper()}</strong> — system
+              overrode to <strong>{system_priority.upper()}</strong> based on
+              <strong>{severity.upper()}</strong> severity analysis.
+            </p>
+          </div>
+        </td></tr>"""
+        override_text = (
+            f"\n⚠ Priority adjusted: {original_priority.upper()} → "
+            f"{system_priority.upper()} ({severity.upper()} severity)\n"
+        )
+
+    html_body = f"""<!DOCTYPE html><html lang="en"><head>
+<meta charset="UTF-8"/><meta name="viewport" content="width=device-width,initial-scale=1.0"/>
+</head><body style="margin:0;padding:0;background:#F8FAFC;font-family:'Inter',system-ui,sans-serif;">
+<table width="100%" cellpadding="0" cellspacing="0" style="background:#F8FAFC;padding:40px 16px;">
+<tr><td align="center">
+<table width="600" cellpadding="0" cellspacing="0"
+  style="background:#FFF;border-radius:12px;border:1px solid #E2E8F0;overflow:hidden;max-width:600px;width:100%;">
+  {_header()}
+  <tr><td style="padding:36px 40px 32px;">
+    <p style="margin:0 0 8px;font-size:22px;font-weight:700;color:#0F172A;">New ticket for your team</p>
+    <p style="margin:0 0 28px;font-size:14px;color:#64748B;line-height:1.6;">
+      Hi <strong>{lead_name}</strong>, a new support ticket has been routed to your team
+      and needs an agent assignment.</p>
+    <table width="100%" cellpadding="0" cellspacing="0"
+      style="background:#F8FAFC;border:1px solid #E2E8F0;border-radius:10px;padding:20px 24px;margin-bottom:24px;">
+      {_detail_header()}
+      {_row("Ticket number", f'<span style="font-size:13px;font-weight:700;color:#2563EB;font-family:monospace;background:#EFF6FF;padding:2px 8px;border-radius:4px;">{ticket_number}</span>')}
+      {_row("Subject", f'<span style="font-size:13px;font-weight:600;color:#0F172A;">{ticket_title}</span>')}
+      {_row("Customer", f'<span style="font-size:13px;color:#0F172A;">{customer_email}</span>')}
+      {_row("Severity", f'<span style="font-size:12px;font-weight:700;background:{sev_bg};color:{sev_col};padding:2px 10px;border-radius:100px;text-transform:uppercase;">{severity}</span>')}
+      {_row("Priority", f'<span style="font-size:13px;font-weight:600;color:#0F172A;">{priority.upper()}</span>')}
+      {_row("Status", _status_pill("acknowledged"))}
+      {override_html}
+    </table>
+    <div style="background:#EFF6FF;border-radius:8px;padding:16px 20px;">
+      <p style="margin:0 0 4px;font-size:14px;font-weight:700;color:#1D4ED8;">📋 Action required</p>
+      <p style="margin:0;font-size:13px;color:#1E40AF;line-height:1.6;">
+        Please log in to the Team Lead portal and assign an available support agent to this ticket.</p>
+    </div>
+  </td></tr>
+  {_footer()}
+</table></td></tr></table></body></html>"""
+
+    text_body = (
+        f"Hi {lead_name},\n\nA new ticket has been routed to your team.\n\n"
+        f"Ticket   : {ticket_number}\nSubject  : {ticket_title}\n"
+        f"Customer : {customer_email}\n"
+        f"Severity : {severity.upper()}\nPriority : {priority.upper()}\n"
+        f"{override_text}\n"
+        f"Please assign an agent via the Team Lead portal.\n\n— TicketingGenie Support"
+    )
+    return EmailPayload(
+        to_email=to_email,
+        subject=f"[{ticket_number}] New ticket assigned to your team — action required",
+        html_body=html_body,
+        text_body=text_body,
+    )
+
+
+def build_agent_assigned_email(
+    *,
+    to_email:      str,
+    ticket_number: str,
+    ticket_title:  str,
+    severity:      str,
+    priority:      str,
+) -> EmailPayload:
+    """Email to the support agent when a ticket is assigned to them."""
+    sev_colours = {
+        "critical": ("#FEF2F2", "#DC2626"), "high": ("#FFF7ED", "#D97706"),
+        "medium":   ("#FFFBEB", "#CA8A04"), "low":  ("#F0FDF4", "#16A34A"),
+    }
+    sev_bg, sev_col = sev_colours.get(severity.lower(), ("#F1F5F9", "#334155"))
+
+    html_body = f"""<!DOCTYPE html><html lang="en"><head>
+<meta charset="UTF-8"/><meta name="viewport" content="width=device-width,initial-scale=1.0"/>
+</head><body style="margin:0;padding:0;background:#F8FAFC;font-family:'Inter',system-ui,sans-serif;">
+<table width="100%" cellpadding="0" cellspacing="0" style="background:#F8FAFC;padding:40px 16px;">
+<tr><td align="center">
+<table width="600" cellpadding="0" cellspacing="0"
+  style="background:#FFF;border-radius:12px;border:1px solid #E2E8F0;overflow:hidden;max-width:600px;width:100%;">
+  {_header()}
+  <tr><td style="padding:36px 40px 32px;">
+    <p style="margin:0 0 8px;font-size:22px;font-weight:700;color:#0F172A;">
+      A ticket has been assigned to you</p>
+    <p style="margin:0 0 28px;font-size:14px;color:#64748B;line-height:1.6;">
+      Hi <strong>{to_email}</strong>, your team lead has assigned the following
+      support ticket to you. Please review and start working when ready.</p>
+    <table width="100%" cellpadding="0" cellspacing="0"
+      style="background:#F8FAFC;border:1px solid #E2E8F0;border-radius:10px;padding:20px 24px;margin-bottom:24px;">
+      {_detail_header()}
+      {_row("Ticket number", f'<span style="font-size:13px;font-weight:700;color:#2563EB;font-family:monospace;background:#EFF6FF;padding:2px 8px;border-radius:4px;">{ticket_number}</span>')}
+      {_row("Subject", f'<span style="font-size:13px;font-weight:600;color:#0F172A;">{ticket_title}</span>')}
+      {_row("Severity", f'<span style="font-size:12px;font-weight:700;background:{sev_bg};color:{sev_col};padding:2px 10px;border-radius:100px;text-transform:uppercase;">{severity}</span>')}
+      {_row("Priority", f'<span style="font-size:13px;font-weight:600;color:#0F172A;">{priority.upper()}</span>')}
+      {_row("Status", _status_pill("assigned"))}
+    </table>
+    <div style="background:#F0FDF4;border-radius:8px;padding:16px 20px;">
+      <p style="margin:0 0 4px;font-size:14px;font-weight:700;color:#15803D;">
+        🧑‍💻 Next step</p>
+      <p style="margin:0;font-size:13px;color:#166534;line-height:1.6;">
+        Log in to the agent portal, open the ticket, and click <strong>Start Working</strong>
+        to start the SLA response timer.</p>
+    </div>
+  </td></tr>
+  {_footer()}
+</table></td></tr></table></body></html>"""
+
+    text_body = (
+        f"Hi {to_email},\n\nA ticket has been assigned to you.\n\n"
+        f"Ticket   : {ticket_number}\nSubject  : {ticket_title}\n"
+        f"Severity : {severity.upper()}\nPriority : {priority.upper()}\n\n"
+        f"Log in and click 'Start Working' to begin.\n\n— TicketingGenie Support"
+    )
+    return EmailPayload(
+        to_email=to_email,
+        subject=f"[{ticket_number}] Ticket assigned to you — please start working",
+        html_body=html_body,
+        text_body=text_body,
+    )
+
+
+def build_escalation_customer_notice_email(
+    *,
+    to_email:       str,
+    ticket_number:  str,
+    ticket_title:   str,
+    current_status: str,
+) -> EmailPayload:
+    """
+    Reassuring email to the customer when their ticket is escalated.
+    Does NOT expose SLA or internal escalation details.
+    """
+    html_body = f"""<!DOCTYPE html><html lang="en"><head>
+<meta charset="UTF-8"/><meta name="viewport" content="width=device-width,initial-scale=1.0"/>
+</head><body style="margin:0;padding:0;background:#F8FAFC;font-family:'Inter',system-ui,sans-serif;">
+<table width="100%" cellpadding="0" cellspacing="0" style="background:#F8FAFC;padding:40px 16px;">
+<tr><td align="center">
+<table width="600" cellpadding="0" cellspacing="0"
+  style="background:#FFF;border-radius:12px;border:1px solid #E2E8F0;overflow:hidden;max-width:600px;width:100%;">
+  {_header()}
+  <tr><td style="padding:36px 40px 32px;">
+    <p style="margin:0 0 8px;font-size:22px;font-weight:700;color:#0F172A;">We're still on it</p>
+    <p style="margin:0 0 28px;font-size:14px;color:#64748B;line-height:1.6;">
+      Hi <strong>{to_email}</strong>, we wanted to update you on your support ticket.</p>
+    <table width="100%" cellpadding="0" cellspacing="0"
+      style="background:#F8FAFC;border:1px solid #E2E8F0;border-radius:10px;padding:20px 24px;margin-bottom:24px;">
+      {_detail_header()}
+      {_row("Ticket number", f'<span style="font-size:13px;font-weight:700;color:#2563EB;font-family:monospace;background:#EFF6FF;padding:2px 8px;border-radius:4px;">{ticket_number}</span>')}
+      {_row("Subject", f'<span style="font-size:13px;font-weight:600;color:#0F172A;">{ticket_title}</span>')}
+      {_row("Current status", _status_pill(current_status))}
+    </table>
+    <div style="background:#FFF7ED;border-radius:8px;padding:16px 20px;margin-bottom:16px;">
+      <p style="margin:0 0 4px;font-size:14px;font-weight:700;color:#C2410C;">
+        ⏳ Update on your request</p>
+      <p style="margin:0;font-size:13px;color:#7C2D12;line-height:1.6;">
+        We are still actively working on your ticket and it has been escalated for
+        priority attention. Our team is committed to resolving this as quickly as possible.
+        We will send you a further update once there is progress.</p>
+    </div>
+    <p style="font-size:12px;color:#94A3B8;margin:0;">
+      Thank you for your patience. If you have any additional information that may help,
+      please add a comment to your ticket.</p>
+  </td></tr>
+  {_footer()}
+</table></td></tr></table></body></html>"""
+
+    text_body = (
+        f"Hi {to_email},\n\nWe wanted to update you on your support ticket.\n\n"
+        f"Ticket  : {ticket_number}\nSubject : {ticket_title}\n"
+        f"Status  : {current_status.replace('_', ' ').upper()}\n\n"
+        f"We are still actively working on your request and it has been escalated "
+        f"for priority attention. We will update you as soon as there is progress.\n\n"
+        f"Thank you for your patience.\n\n— TicketingGenie Support"
+    )
+    return EmailPayload(
+        to_email=to_email,
+        subject=f"[{ticket_number}] Update on your support request — we're still working on it",
+        html_body=html_body,
+        text_body=text_body,
+    )
+
+
+def build_escalation_agent_reassignment_email(
+    *,
+    to_email:      str,
+    ticket_number: str,
+    ticket_title:  str,
+    severity:      str,
+    priority:      str,
+    current_status: str,
+    response_due_at: Optional[str] = None,
+) -> EmailPayload:
+    """Email to the new agent after an escalated ticket is reassigned to them."""
+    sev_colours = {
+        "critical": ("#FEF2F2", "#DC2626"), "high": ("#FFF7ED", "#D97706"),
+        "medium":   ("#FFFBEB", "#CA8A04"), "low":  ("#F0FDF4", "#16A34A"),
+    }
+    sev_bg, sev_col = sev_colours.get(severity.lower(), ("#F1F5F9", "#334155"))
+    deadline_html = (
+        _row("Response deadline", f'<span style="font-size:13px;font-weight:700;color:#DC2626;">{response_due_at}</span>')
+        if response_due_at else ""
+    )
+
+    html_body = f"""<!DOCTYPE html><html lang="en"><head>
+<meta charset="UTF-8"/><meta name="viewport" content="width=device-width,initial-scale=1.0"/>
+</head><body style="margin:0;padding:0;background:#F8FAFC;font-family:'Inter',system-ui,sans-serif;">
+<table width="100%" cellpadding="0" cellspacing="0" style="background:#F8FAFC;padding:40px 16px;">
+<tr><td align="center">
+<table width="600" cellpadding="0" cellspacing="0"
+  style="background:#FFF;border-radius:12px;border:1px solid #E2E8F0;overflow:hidden;max-width:600px;width:100%;">
+  {_header()}
+  <tr><td style="background:#FEF2F2;border-bottom:2px solid #FCA5A5;padding:14px 40px;">
+    <p style="margin:0;font-size:14px;font-weight:800;color:#DC2626;">
+      🚨 Escalated ticket reassigned to you — immediate action required</p>
+  </td></tr>
+  <tr><td style="padding:36px 40px 32px;">
+    <p style="margin:0 0 8px;font-size:22px;font-weight:700;color:#0F172A;">
+      Escalated ticket assigned to you</p>
+    <p style="margin:0 0 28px;font-size:14px;color:#64748B;line-height:1.6;">
+      Hi <strong>{to_email}</strong>, an escalated ticket has been reassigned to you
+      by your team lead. SLA timers start when you click <strong>Start Working</strong>.</p>
+    <table width="100%" cellpadding="0" cellspacing="0"
+      style="background:#F8FAFC;border:1px solid #E2E8F0;border-radius:10px;padding:20px 24px;margin-bottom:24px;">
+      {_detail_header()}
+      {_row("Ticket number", f'<span style="font-size:13px;font-weight:700;color:#2563EB;font-family:monospace;background:#EFF6FF;padding:2px 8px;border-radius:4px;">{ticket_number}</span>')}
+      {_row("Subject", f'<span style="font-size:13px;font-weight:600;color:#0F172A;">{ticket_title}</span>')}
+      {_row("Severity", f'<span style="font-size:12px;font-weight:700;background:{sev_bg};color:{sev_col};padding:2px 10px;border-radius:100px;text-transform:uppercase;">{severity}</span>')}
+      {_row("Priority", f'<span style="font-size:13px;font-weight:600;color:#0F172A;">{priority.upper()}</span>')}
+      {_row("Current status", _status_pill(current_status))}
+      {deadline_html}
+    </table>
+    <div style="background:#FEF2F2;border-radius:8px;padding:16px 20px;">
+      <p style="margin:0 0 10px;font-size:14px;font-weight:700;color:#DC2626;">⚡ What you need to do</p>
+      <ul style="margin:0;padding-left:18px;font-size:13px;color:#B91C1C;line-height:2;">
+        <li>Review the full ticket history and all prior comments</li>
+        <li>Click <strong>Start Working</strong> immediately to stop the response SLA timer</li>
+        <li>Keep the customer updated via comments</li>
+        <li>Resolve the ticket within the resolution deadline</li>
+      </ul>
+    </div>
+  </td></tr>
+  {_footer()}
+</table></td></tr></table></body></html>"""
+
+    text_body = (
+        f"Hi {to_email},\n\n🚨 ESCALATED TICKET REASSIGNED TO YOU\n\n"
+        f"Ticket   : {ticket_number}\nSubject  : {ticket_title}\n"
+        f"Severity : {severity.upper()}\nPriority : {priority.upper()}\n"
+        f"Status   : {current_status.replace('_', ' ').upper()}\n"
+        + (f"Response deadline : {response_due_at}\n" if response_due_at else "")
+        + f"\nClick 'Start Working' immediately to begin SLA tracking.\n\n"
+        f"— TicketingGenie Support"
+    )
+    return EmailPayload(
+        to_email=to_email,
+        subject=f"🚨 [{ticket_number}] Escalated ticket reassigned to you — start working now",
+        html_body=html_body,
+        text_body=text_body,
+    )
+
+
+def build_sla_breach_customer_email(
+    *,
+    to_email:      str,
+    ticket_number: str,
+    ticket_title:  str,
+    current_status: str,
+    is_second_breach: bool = False,
+) -> EmailPayload:
+    """
+    Email to customer on SLA breach/escalation.
+    is_second_breach=True gives a slightly different message for the second breach.
+    """
+    if is_second_breach:
+        heading   = "We sincerely apologise for the continued delay"
+        body_text = (
+            "We are aware that your ticket has experienced an extended delay and we "
+            "sincerely apologise. Our team is treating your case as a top priority. "
+            "We are taking immediate action to resolve this for you."
+        )
+        subject_prefix = "Important update"
+    else:
+        heading   = "We're still working on your ticket"
+        body_text = (
+            "Your ticket has been escalated for priority attention. "
+            "We are committed to resolving this as quickly as possible and will "
+            "update you as soon as there is meaningful progress."
+        )
+        subject_prefix = "Update"
+
+    html_body = f"""<!DOCTYPE html><html lang="en"><head>
+<meta charset="UTF-8"/><meta name="viewport" content="width=device-width,initial-scale=1.0"/>
+</head><body style="margin:0;padding:0;background:#F8FAFC;font-family:'Inter',system-ui,sans-serif;">
+<table width="100%" cellpadding="0" cellspacing="0" style="background:#F8FAFC;padding:40px 16px;">
+<tr><td align="center">
+<table width="600" cellpadding="0" cellspacing="0"
+  style="background:#FFF;border-radius:12px;border:1px solid #E2E8F0;overflow:hidden;max-width:600px;width:100%;">
+  {_header()}
+  <tr><td style="padding:36px 40px 32px;">
+    <p style="margin:0 0 8px;font-size:22px;font-weight:700;color:#0F172A;">{heading}</p>
+    <p style="margin:0 0 28px;font-size:14px;color:#64748B;line-height:1.6;">
+      Hi <strong>{to_email}</strong>, here is an update on your open support ticket.</p>
+    <table width="100%" cellpadding="0" cellspacing="0"
+      style="background:#F8FAFC;border:1px solid #E2E8F0;border-radius:10px;padding:20px 24px;margin-bottom:24px;">
+      {_detail_header()}
+      {_row("Ticket number", f'<span style="font-size:13px;font-weight:700;color:#2563EB;font-family:monospace;background:#EFF6FF;padding:2px 8px;border-radius:4px;">{ticket_number}</span>')}
+      {_row("Subject", f'<span style="font-size:13px;font-weight:600;color:#0F172A;">{ticket_title}</span>')}
+      {_row("Current status", _status_pill(current_status))}
+    </table>
+    <div style="background:#FFF7ED;border-radius:8px;padding:16px 20px;">
+      <p style="margin:0 0 4px;font-size:14px;font-weight:700;color:#C2410C;">⏳ Status update</p>
+      <p style="margin:0;font-size:13px;color:#7C2D12;line-height:1.6;">{body_text}</p>
+    </div>
+  </td></tr>
+  {_footer()}
+</table></td></tr></table></body></html>"""
+
+    text_body = (
+        f"Hi {to_email},\n\n{heading}\n\n"
+        f"Ticket  : {ticket_number}\nSubject : {ticket_title}\n"
+        f"Status  : {current_status.replace('_', ' ').upper()}\n\n"
+        f"{body_text}\n\nThank you for your patience.\n\n— TicketingGenie Support"
+    )
+    return EmailPayload(
+        to_email=to_email,
+        subject=f"[{ticket_number}] {subject_prefix}: your support ticket",
         html_body=html_body,
         text_body=text_body,
     )

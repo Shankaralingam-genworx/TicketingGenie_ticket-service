@@ -7,7 +7,7 @@ from typing import List, Optional
 from pydantic import BaseModel, Field, computed_field
 
 from src.constants.priority_constants import Priority
-from src.constants.sla_constants import CustomerTier, Severity
+from src.constants.sla_constants import Severity
 from src.constants.ticket_constants import TicketSource, TicketStatus
 from src.schemas.issue_schema import IssueResponse
 from src.schemas.sla_schema import SLAResponse
@@ -71,8 +71,11 @@ class TicketResponse(BaseModel):
     title:          str
     description:    str
     customer_id:    int
-    customer_tier:  CustomerTier
+    # Plain tier name string (e.g. "smb", "enterprise") — not an enum.
+    customer_tier:  str
     customer_email: str
+    # org_id from auth service — NULL for customers not in an organisation.
+    org_id:         int | None = None
     issue_id:       int | None
     issue:          IssueResponse | None = None
 

@@ -1,79 +1,28 @@
-"""
-LangGraph email-to-ticket pipeline.
-File path: src/core/agents/email_intake_graph.py
-
-Pipeline
-────────────────────────────────────────────────────────────────────
-  Node 1  validate_customer   Verify From: email belongs to a registered
-                               customer via Auth service. Rejects unknowns.
-
-  Node 2  check_thread        Inspect In-Reply-To / References headers.
-                               If an active thread is found → route to
-                               add_comment; otherwise continue as new ticket.
-
-  Node 3  validate_content    Groq LLM decides if the email is a genuine
-                               support request (not OOO / spam / auto-reply).
-                               Extracts cleaned_title, cleaned_description,
-                               issue_category.
-
-  Node 4  classify_issue      Map LLM-extracted issue_category to an Issue
-                               row in the DB.
-
-  Node 5  detect_severity     Run the existing keyword-based SeverityAgent.
-
-  Node 6  create_ticket       Full ticket creation — identical to web flow:
-                               SLA lookup, team routing, DB insert, audit log,
-                               Celery acknowledgement email, in-app notification,
-                               email_thread record.
-
-  Node 7  add_comment         Reply path — add email body as a Comment on the
-                               existing ticket, touch thread, notify agent.
-
-  Node 8  reject_email        Record rejection in email_threads with reason.
-
-Routing
-────────────────────────────────────────────────────────────────────
-  validate_customer  → check_thread  |  reject_email
-  check_thread       → validate_content  |  reply_validate_content
-  validate_content   → classify_issue    |  reject_email
-  reply_validate_content → add_comment  |  reject_email
-  classify_issue     → detect_severity   |  reject_email
-  detect_severity    → create_ticket
-  create_ticket      → END
-  add_comment        → END
-  reject_email       → END
-
-Install:
-    pip install langgraph langchain-groq httpx
-────────────────────────────────────────────────────────────────────
-"""
-
 from __future__ import annotations
 
+from datetime import datetime, timezone
+import httpx
 import json
 import logging
 import random
 import re
 import string
 import uuid
-from datetime import datetime, timezone
 from typing import Optional, TypedDict
 
-import httpx
 from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_groq import ChatGroq
 from langgraph.graph import END, StateGraph
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
 from src.config.settings import settings
 from src.constants.issue_constants import IssueCategory
 from src.constants.priority_constants import SEVERITY_TO_PRIORITY
-from src.constants.sla_constants import AuditAction, CommentSource, CustomerTier
+from src.constants.sla_constants import AuditAction, CommentSource
 from src.constants.ticket_constants import TicketSource, TicketStatus
 from src.control.agents.severity_agent import SeverityAgent
 from src.core.celery.workers.email_tasks import send_ticket_acknowledgement_task
 from src.core.services.notification_service import NotificationService
-from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
-from src.data.clients.postgres_client import Base
 from src.data.models.postgres.email_thread_model import EmailThreadStatus
 from src.data.models.postgres.notification_model import NotificationActor
 from src.data.repositories.comment_repository import CommentRepository
@@ -88,17 +37,6 @@ from src.utils.sla_utils import compute_due_at
 logger = logging.getLogger("ticket.email_intake")
 
 
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# DB session factory
-# Creates a FRESH engine+session bound to the current event loop.
-# Required for Celery prefork workers — the module-level AsyncSessionLocal
-# is bound to the parent process loop and causes "Future attached to a
-# different loop" errors. Calling this inside an already-running coroutine
-# guarantees the engine is created on the correct loop.
-# ─────────────────────────────────────────────────────────────────────────────
-
 def _make_session() -> AsyncSession:
     """Return an AsyncSession bound to the currently-running event loop."""
     engine = create_async_engine(
@@ -111,9 +49,6 @@ def _make_session() -> AsyncSession:
     factory = async_sessionmaker(bind=engine, class_=AsyncSession, expire_on_commit=False)
     return factory()
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Shared state
-# ─────────────────────────────────────────────────────────────────────────────
 
 class EmailIntakeState(TypedDict, total=False):
     # Raw inbound email
@@ -127,7 +62,8 @@ class EmailIntakeState(TypedDict, total=False):
     # Resolved customer
     customer_email: str
     customer_id:    Optional[int]
-    customer_tier:  Optional[str]   # "enterprise" | "smb"
+    customer_tier:  Optional[str]   
+    org_id:         Optional[int]   
     customer_valid: bool
 
     # Thread detection
@@ -211,11 +147,12 @@ async def validate_customer(state: EmailIntakeState) -> EmailIntakeState:
             data = resp.json()
             if data.get("role", "").lower() == "customer":
                 state["customer_id"]    = int(data["id"])
-                state["customer_tier"]  = data.get("customer_tier", "smb")
+                state["customer_tier"]  = (data.get("customer_tier") or "smb").lower()
+                state["org_id"]         = data.get("org_id")   # NEW — from auth lookup
                 state["customer_valid"] = True
                 logger.info(
                     f"[intake] Customer validated: {email} id={data['id']} "
-                    f"tier={state['customer_tier']}"
+                    f"tier={state['customer_tier']} org_id={state['org_id']}"
                 )
                 return state
 
@@ -394,23 +331,20 @@ async def classify_issue(state: EmailIntakeState) -> EmailIntakeState:
 # ─────────────────────────────────────────────────────────────────────────────
 
 async def detect_severity(state: EmailIntakeState) -> EmailIntakeState:
-    """
-    Run the keyword-based SeverityAgent on cleaned content.
-    Applies enterprise-tier escalation just like the web flow.
-    """
-    title      = state.get("cleaned_title")      or state.get("raw_subject", "")
-    description= state.get("cleaned_description") or state.get("raw_body", "")
-    issue_name = state.get("issue_name")          or ""
+    title       = state.get("cleaned_title")       or state.get("raw_subject", "")
+    description = state.get("cleaned_description") or state.get("raw_body", "")
+    issue_name  = state.get("issue_name")           or ""
 
-    severity = await SeverityAgent().detect(
-        issue_name  = issue_name,
-        title       = title,
-        description = description,
-    )
+    async with _make_session() as session:
+        severity = await SeverityAgent(session).detect(
+            issue_name  = issue_name,
+            title       = title,
+            description = description,
+        )
+
     sev = severity.value
 
-    # Enterprise escalation — identical to web ticket_service
-    if (state.get("customer_tier") or "smb") == "enterprise":
+    if (state.get("customer_tier") or "smb").lower() == "enterprise":
         if sev == "high":     sev = "critical"
         elif sev == "medium": sev = "high"
         elif sev == "low":    sev = "medium"
@@ -418,7 +352,6 @@ async def detect_severity(state: EmailIntakeState) -> EmailIntakeState:
     state["severity"] = sev
     logger.info(f"[intake] Severity: {sev}")
     return state
-
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Node 6 — create_ticket
@@ -435,7 +368,9 @@ async def create_ticket(state: EmailIntakeState) -> EmailIntakeState:
 
     customer_id    = state["customer_id"]
     customer_email = state["customer_email"]
-    customer_tier  = CustomerTier(state.get("customer_tier") or CustomerTier.SMB)
+    # Plain lowercase string from auth service lookup — no longer an enum.
+    customer_tier  = (state.get("customer_tier") or "smb").lower()
+    org_id         = state.get("org_id")   # NEW — from validate_customer node
     severity       = Severity(state["severity"])
     issue_id       = state["issue_id"]
     title          = state["cleaned_title"]
@@ -483,6 +418,7 @@ async def create_ticket(state: EmailIntakeState) -> EmailIntakeState:
                     customer_id                     = customer_id,
                     customer_email                  = customer_email,
                     customer_tier                   = customer_tier,
+                    org_id                          = org_id,
                     issue_id                        = issue_id,
                     # email has no customer priority choice — set same as system
                     customer_priority               = system_priority,

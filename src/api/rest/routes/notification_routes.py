@@ -1,48 +1,11 @@
-"""
-Notification routes — REST CRUD + SSE stream.
-
-File path: src/api/rest/routes/notification_routes.py
-
-Endpoints
----------
-GET  /notifications/               → list notifications for current user
-GET  /notifications/unread-count   → badge counter (no SSE needed for initial load)
-PATCH /notifications/{id}/read     → mark one read
-PATCH /notifications/read-all      → mark all read
-GET  /notifications/stream         → SSE stream — pushes unread count whenever
-                                      something is written to Redis pub/sub channel
-                                      "notifications:{user_id}"
-
-SSE design
-----------
-The Celery tasks (and the comment / ticket service) publish to Redis when they
-create a notification.  The browser keeps one EventSource open per session on
-/api/v1/notifications/stream.  Every push carries a small JSON payload:
-
-    {
-      "event": "notification",
-      "unread_count": 3,
-      "notification": { ...NotificationResponse fields... }
-    }
-
-A keep-alive ping is sent every 20 s so the connection stays alive through
-proxies.
-
-Register in app.py:
-    from src.api.rest.routes import notification_routes
-    app.include_router(notification_routes.router, prefix="/api/v1")
-"""
-
 import asyncio
-import json
-import logging
 from datetime import datetime, timezone
-
-import redis.asyncio as aioredis
 from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import StreamingResponse
+import json
+import logging
+import redis.asyncio as aioredis
 from sqlalchemy.ext.asyncio import AsyncSession
-
 from src.api.dependencies import get_current_user
 from src.config.settings import settings
 from src.data.clients.postgres_client import get_db
@@ -52,6 +15,7 @@ from src.schemas.notification_schema import (
     NotificationResponse,
     UnreadCountResponse,
 )
+
 
 logger = logging.getLogger("ticket.notifications")
 router = APIRouter(prefix="/notifications", tags=["Notifications"])

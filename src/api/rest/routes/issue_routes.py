@@ -2,14 +2,13 @@
 
 from fastapi import APIRouter, Depends, status
 from sqlalchemy.ext.asyncio import AsyncSession
-
 from src.api.dependencies import get_current_user, require_role
 from src.core.services.issue_service import IssueService
 from src.data.clients.postgres_client import get_db
 from src.schemas.issue_schema import IssueCreateRequest, IssueResponse, IssueUpdateRequest
 
-router = APIRouter(prefix="/issues", tags=["Issues"])
 
+router = APIRouter(prefix="/issues", tags=["Issues"])
 
 @router.post("/", response_model=IssueResponse, status_code=status.HTTP_201_CREATED)
 async def create_issue(

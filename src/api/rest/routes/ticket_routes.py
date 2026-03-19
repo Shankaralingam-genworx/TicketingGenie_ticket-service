@@ -1,35 +1,23 @@
-"""
-Ticket routes.
-File: src/api/rest/routes/ticket_routes.py
-"""
-
-import os
-
-from fastapi import APIRouter, Depends, Query
+from fastapi import APIRouter, Depends, File, Form, Query, UploadFile
 from sqlalchemy.ext.asyncio import AsyncSession
 from typing import List, Optional
-
 from src.api.dependencies import get_current_user, require_role
-from src.constants.ticket_constants import TicketStatus
 from src.constants.priority_constants import Priority
+from src.constants.ticket_constants import TicketStatus
 from src.core.services.assignment_service import AssignmentService
 from src.core.services.ticket_service import TicketService
-from src.core.services.comment_service import CommentService
-from src.data.repositories.shared_user_repository import SharedUserRepository
 from src.data.clients.postgres_client import get_db
+from src.data.repositories.shared_user_repository import SharedUserRepository
+from src.schemas.ticket_filter_schema import parse_ticket_filters, TicketFilterParams
 from src.schemas.ticket_schema import (
+    AgentWorkloadResponse,
     EscalationReassignRequest,
+    PaginatedTicketResponse,
     TicketAssignRequest,
     TicketResponse,
     TicketStatusUpdateRequest,
-    PaginatedTicketResponse,
-    AgentWorkloadResponse,
 )
-from src.schemas.ticket_filter_schema import TicketFilterParams, parse_ticket_filters
-from src.schemas.comment_schema import CommentCreateRequest, CommentResponse
-from fastapi import UploadFile, File, Form
-from src.data.repositories.ticket_repository import TicketRepository
-from src.core.exceptions.base_exception import NotFoundException
+
 
 router = APIRouter(prefix="/tickets", tags=["Tickets"])
 
@@ -63,16 +51,8 @@ async def my_tickets(
 
 # ── Support Agent listings ────────────────────────────────────────────────────
 
-@router.get("/assigned", response_model=list[TicketResponse])
+@router.get("/assigned", response_model=PaginatedTicketResponse)
 async def my_assigned_tickets(
-    current_user: dict         = Depends(require_role("support_agent")),
-    db:           AsyncSession = Depends(get_db),
-):
-    return await TicketService(db).get_agent_tickets(current_user["user_id"])
-
-
-@router.get("/assigned/all", response_model=PaginatedTicketResponse)
-async def my_all_tickets(
     current_user: dict               = Depends(require_role("support_agent")),
     filters:      TicketFilterParams = Depends(parse_ticket_filters),
     db:           AsyncSession       = Depends(get_db),
@@ -81,6 +61,8 @@ async def my_all_tickets(
     return await TicketService(db).get_agent_tickets_filtered(
         agent_id=current_user["user_id"], filters=filters,
     )
+
+
 
 
 # ── Team Lead — fixed-path routes (must come before /{ticket_id}) ────────────

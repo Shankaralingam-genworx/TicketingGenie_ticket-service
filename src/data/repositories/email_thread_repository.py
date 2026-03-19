@@ -1,7 +1,3 @@
-"""
-EmailThread repository.
-File path: src/data/repositories/email_thread_repository.py
-"""
 
 from datetime import datetime, timezone
 from typing import Optional
@@ -67,15 +63,7 @@ class EmailThreadRepository:
         in_reply_to: Optional[str],
         references:  Optional[str],
     ) -> Optional[EmailThread]:
-        """
-        Match an incoming reply to an existing ACTIVE thread using the
-        In-Reply-To and References email headers.
-
-        Strategy:
-          1. Try In-Reply-To first  (most specific — direct parent message)
-          2. Walk References right-to-left (newest reference first)
-          Returns the first ACTIVE thread found, or None.
-        """
+     
         candidates: list[str] = []
         if in_reply_to:
             candidates.append(in_reply_to.strip())

@@ -1,11 +1,3 @@
-"""Comment Pydantic schemas.
-File: src/schemas/comment_schema.py
-
-Changes from previous version:
-  CommentCreateRequest — content is now optional (can send image-only comment)
-  CommentResponse     — added attachments: list[AttachmentMeta] | None
-"""
-
 from datetime import datetime
 from typing import List, Optional
 

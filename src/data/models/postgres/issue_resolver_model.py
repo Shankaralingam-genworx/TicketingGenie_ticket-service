@@ -1,15 +1,7 @@
-"""IssueResolver ORM model — maps an issue type to the responsible team.
-
-Cross-service ref: team_id → teams.id (auth service, same DB).
-Stored as plain Integer — no ForeignKey() declaration to avoid
-NoReferencedTableError on create_all (teams is not in this Base).
-"""
 
 from datetime import datetime, timezone
-
 from sqlalchemy import Boolean, DateTime, ForeignKey, Integer, String
 from sqlalchemy.orm import Mapped, mapped_column, relationship
-
 from src.data.clients.postgres_client import Base
 
 

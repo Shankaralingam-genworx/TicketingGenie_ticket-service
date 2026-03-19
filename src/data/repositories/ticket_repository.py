@@ -6,8 +6,8 @@ Complete replacement of the existing file.
 All original methods are kept UNCHANGED.
 Five new methods are added at the bottom for the team-lead filtered views:
 
-  get_team_queue_filtered          – NEW+ACKNOWLEDGED, unassigned
-  count_team_queue_filtered        – total count for pagination
+  get_team_queue_filtered           NEW+ACKNOWLEDGED, unassigned
+  count_team_queue_filtered         total count for pagination
   get_team_tickets_filtered        – all team tickets
   count_team_tickets_filtered      – total count for pagination
   get_agent_tickets_filtered       – tickets for one agent (workload detail)
@@ -89,6 +89,9 @@ class TicketRepository:
                 from src.data.models.postgres.issue_model import Issue
                 stmt = stmt.join(Issue, Ticket.issue_id == Issue.id, isouter=True)
                 stmt = stmt.where(Issue.name.ilike(f"%{cat}%"))
+
+        if f.is_escalated is not None:
+            stmt = stmt.where(Ticket.is_escalated == f.is_escalated)  # noqa: E712
 
         return stmt
 
@@ -273,6 +276,29 @@ class TicketRepository:
         stmt = select(func.count()).select_from(Ticket).where(
             Ticket.assigned_agent_id == agent_id
         )
+        stmt = self._apply_where(stmt, f)
+        return (await self.db.execute(stmt)).scalar_one()
+
+    async def get_by_org_filtered(
+        self, org_id: int, f: TicketFilterParams
+    ) -> list[Ticket]:
+        """
+        All tickets whose customer belongs to a given organisation.
+        Uses tickets.org_id which is stored at ticket-creation time
+        (mirrored from auth.users.org_id via the JWT claim).
+        Supports full filter / search / sort / pagination.
+        """
+        stmt = self._base_query().where(Ticket.org_id == org_id)
+        stmt = self._apply_where(stmt, f)
+        stmt = self._apply_sort_page(stmt, f)
+        result = await self.db.execute(stmt)
+        return list(result.scalars().all())
+
+    async def count_by_org_filtered(
+        self, org_id: int, f: TicketFilterParams
+    ) -> int:
+        """Total count for org-scoped filtered listing (used for pagination)."""
+        stmt = select(func.count()).select_from(Ticket).where(Ticket.org_id == org_id)
         stmt = self._apply_where(stmt, f)
         return (await self.db.execute(stmt)).scalar_one()
 

@@ -1,9 +1,3 @@
-"""TicketAudit ORM model — immutable audit trail for every ticket event.
-
-Cross-service ref: actor_id → users.id (auth service, same DB).
-Stored as plain Integer — no ForeignKey() declaration to avoid
-NoReferencedTableError on create_all (users is not in this Base).
-"""
 
 from datetime import datetime, timezone
 
@@ -12,7 +6,6 @@ from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from src.constants.sla_constants import AuditAction
 from src.data.clients.postgres_client import Base
-
 
 class TicketAudit(Base):
     __tablename__ = "ticket_audits"

@@ -1,15 +1,22 @@
 """SLA Pydantic schemas.
 File: src/schemas/sla_schema.py
+
+customer_tier is now a plain string (tier name from auth.customer_tiers).
+customer_tier_id (optional) links to auth.customer_tiers.id.
 """
 
 from datetime import datetime
 from pydantic import BaseModel, Field
-from src.constants.sla_constants import CustomerTier, Severity
+from src.constants.sla_constants import Severity
 
 
 class SLACreateRequest(BaseModel):
     name:                      str   = Field(..., min_length=2, max_length=120)
-    customer_tier:             CustomerTier
+    # Plain tier name string (e.g. "smb", "enterprise") — not an enum.
+    # Must match the `name` field of a record in auth.customer_tiers.
+    customer_tier:             str
+    # Optional: FK to auth.customer_tiers.id for integrity reference.
+    customer_tier_id:          int | None = None
     severity:                  Severity
     response_time_mins:        float = Field(..., gt=0)
     resolution_time_mins:      float = Field(..., gt=0)
@@ -31,7 +38,8 @@ class SLAUpdateRequest(BaseModel):
 class SLAResponse(BaseModel):
     id:                        int
     name:                      str
-    customer_tier:             CustomerTier
+    customer_tier:             str        # plain tier name string
+    customer_tier_id:          int | None # FK reference to auth.customer_tiers.id
     severity:                  Severity
     response_time_mins:        float
     resolution_time_mins:      float

@@ -3,7 +3,7 @@
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from src.constants.sla_constants import CustomerTier, Severity
+from src.constants.sla_constants import Severity
 from src.data.models.postgres.sla_model import SLA
 
 
@@ -23,11 +23,15 @@ class SLARepository:
         return result.scalar_one_or_none()
 
     async def get_by_tier_and_severity(
-        self, tier: CustomerTier, severity: Severity
+        self, tier: str, severity: Severity
     ) -> SLA | None:
+        """
+        Look up the active SLA policy for a given tier name string and severity.
+        `tier` is a plain lowercase string (e.g. "smb", "enterprise") — not an enum.
+        """
         result = await self.db.execute(
             select(SLA).where(
-                SLA.customer_tier == tier,
+                SLA.customer_tier == tier.lower(),
                 SLA.severity == severity,
                 SLA.is_active.is_(True),
             )

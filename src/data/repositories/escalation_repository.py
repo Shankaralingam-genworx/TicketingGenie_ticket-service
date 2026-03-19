@@ -1,6 +1,3 @@
-"""Escalation repository.
-File: src/data/repositories/escalation_repository.py
-"""
 
 from datetime import datetime, timezone
 
