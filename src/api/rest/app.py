@@ -1,5 +1,6 @@
 from fastapi import FastAPI
 from fastapi.openapi.utils import get_openapi
+
 from src.api.middleware.auth_client_middleware import add_auth_middleware
 from src.api.middleware.cors import add_cors_middleware
 from src.api.middleware.error_handler import add_error_handlers
@@ -19,7 +20,10 @@ from src.api.rest.routes import (
     websocket,
 )
 from src.api.rest.routes.org_routes import router as org_router
-from src.api.rest.routes.severity_keyword_routes import router as severity_keyword_router
+from src.api.rest.routes.severity_keyword_routes import (
+    router as severity_keyword_router,
+)
+
 
 def create_app() -> FastAPI:
     app = FastAPI(
@@ -30,35 +34,38 @@ def create_app() -> FastAPI:
         redoc_url="/redoc",
     )
 
+    
+    add_logging_middleware(app)
     add_error_handlers(app)
     add_auth_middleware(app)
-    add_logging_middleware(app)
     add_cors_middleware(app)
 
     # Routers
     app.include_router(health.router)
-    app.include_router(ticket_routes.router,           prefix="/api/v1")
-    app.include_router(issue_routes.router,            prefix="/api/v1")
-    app.include_router(issue_resolver_routes.router,   prefix="/api/v1")
-    app.include_router(sla_routes.router,              prefix="/api/v1")
-    app.include_router(comment_routes.router,          prefix="/api/v1")
-    app.include_router(dashboard_routes.router,        prefix="/api/v1")
-    app.include_router(notification_routes.router,     prefix="/api/v1")  
-    app.include_router(email_config_routes.router,     prefix="/api/v1")
-    app.include_router(org_router,                     prefix="/api/v1") 
-    app.include_router(severity_keyword_router,        prefix="/api/v1")  
+    app.include_router(ticket_routes.router, prefix="/api/v1")
+    app.include_router(issue_routes.router, prefix="/api/v1")
+    app.include_router(issue_resolver_routes.router, prefix="/api/v1")
+    app.include_router(sla_routes.router, prefix="/api/v1")
+    app.include_router(comment_routes.router, prefix="/api/v1")
+    app.include_router(dashboard_routes.router, prefix="/api/v1")
+    app.include_router(notification_routes.router, prefix="/api/v1")
+    app.include_router(email_config_routes.router, prefix="/api/v1")
+    app.include_router(org_router, prefix="/api/v1")
+    app.include_router(severity_keyword_router, prefix="/api/v1")
     app.include_router(sse.router)
     app.include_router(websocket.router)
 
     def custom_openapi():
         if app.openapi_schema:
             return app.openapi_schema
+
         schema = get_openapi(
             title=app.title,
             version=app.version,
             description=app.description,
             routes=app.routes,
         )
+
         schema["components"]["securitySchemes"] = {
             "bearerAuth": {
                 "type": "http",
@@ -66,11 +73,15 @@ def create_app() -> FastAPI:
                 "bearerFormat": "JWT",
             }
         }
-        for path in schema.get("paths", {}).values():
-            for op in path.values():
-                op["security"] = [{"bearerAuth": []}]
+
+        for path, methods in schema.get("paths", {}).items():
+            for method, op in methods.items():
+                if path != "/health":
+                    op["security"] = [{"bearerAuth": []}]
+
         app.openapi_schema = schema
         return app.openapi_schema
 
     app.openapi = custom_openapi
+
     return app

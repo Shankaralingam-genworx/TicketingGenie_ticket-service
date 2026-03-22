@@ -24,3 +24,13 @@ class CommentResponse(BaseModel):
     created_at:  datetime
 
     model_config = {"from_attributes": True}
+
+
+class CommentEnhanceRequest(BaseModel):
+    """Request to enhance a comment text using LLM."""
+    content: str = Field(..., min_length=1, max_length=5000)
+
+
+class CommentEnhanceResponse(BaseModel):
+    """Response containing enhanced comment text."""
+    enhanced_content: str

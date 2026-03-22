@@ -4,7 +4,12 @@ from src.api.dependencies import get_current_user
 from src.constants.sla_constants import CommentSource
 from src.core.services.comment_service import CommentService
 from src.data.clients.postgres_client import get_db
-from src.schemas.comment_schema import CommentCreateRequest, CommentResponse
+from src.schemas.comment_schema import (
+    CommentCreateRequest,
+    CommentResponse,
+    CommentEnhanceRequest,
+    CommentEnhanceResponse,
+)
 from typing import List
 
 router = APIRouter(prefix="/tickets", tags=["Comments"])
@@ -41,3 +46,19 @@ async def get_comments(
     
     service = CommentService(db)
     return await service.get_comments(ticket_id, current_user["role"])
+
+
+@router.post("/{ticket_id}/comments/enhance", response_model=CommentEnhanceResponse, status_code=200)
+async def enhance_comment(
+    ticket_id:    int,
+    request:      CommentEnhanceRequest,
+    current_user: dict         = Depends(get_current_user),
+    db:           AsyncSession = Depends(get_db),
+):
+   
+    service = CommentService(db)
+    enhanced = await service.enhance_comment(
+        request.content,
+        role=current_user["role"]
+    )
+    return CommentEnhanceResponse(enhanced_content=enhanced)

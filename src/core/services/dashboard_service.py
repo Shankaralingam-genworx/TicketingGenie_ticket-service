@@ -1,11 +1,9 @@
-"""
-Dashboard service — aggregated analytics metrics for the admin view.
-File: src/core/services/dashboard_service.py
-"""
+"""Dashboard metrics — aggregated ticket stats for the admin overview."""
 
 from __future__ import annotations
 
 from datetime import date, datetime, timedelta, timezone
+
 from sqlalchemy import Float, func, cast, and_, case, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -16,10 +14,13 @@ from src.schemas.dashboard_schema import (
     ResponseTimeStat,
     SLABreachTrend,
 )
+from src.observability.logging.logger import get_logger
 
-_UTC            = timezone.utc
-_TREND_DAYS     = 7   # SLA breach trend and response trend window
-_SLA_WINDOW_DAYS = 30
+logger = get_logger(__name__).bind(service="ticket-service")
+
+_UTC             = timezone.utc
+_TREND_DAYS      = 7   
+_SLA_WINDOW_DAYS = 30  
 
 
 def _today_utc() -> date:
@@ -31,41 +32,56 @@ def _days_ago(n: int) -> datetime:
 
 
 class DashboardService:
+
     def __init__(self, db: AsyncSession) -> None:
         self.db = db
 
-    # ── Public entry point ────────────────────────────────────────────────
-
     async def get_metrics(self) -> DashboardMetrics:
-        total          = await self._total_tickets()
-        open_count     = await self._open_tickets()
-        escalated      = await self._escalated_count()
-        by_priority    = await self._priority_breakdown()
-        resolved_today = await self._resolved_today()
-        avg_resolution = await self._avg_resolution_mins()
-        sla_compliance = await self._sla_compliance_rate()
-        breach_trend   = await self._sla_breach_trend()
-        response_trend = await self._response_time_trend()
+        """Gather and return all dashboard metrics in a single call."""
+        logger.info("dashboard_metrics_started")
 
-        return DashboardMetrics(
-            total_tickets=total,
-            open_tickets=open_count,
-            escalated_tickets=escalated,
-            by_priority=by_priority,
-            sla_breach_trend=breach_trend,
-            response_time_trend=response_trend,
-            resolved_today=resolved_today,
-            avg_resolution_mins=avg_resolution,
-            sla_compliance_rate=sla_compliance,
-        )
+        try:
+            total          = await self._total_tickets()
+            open_count     = await self._open_tickets()
+            escalated      = await self._escalated_count()
+            by_priority    = await self._priority_breakdown()
+            resolved_today = await self._resolved_today()
+            avg_resolution = await self._avg_resolution_mins()
+            sla_compliance = await self._sla_compliance_rate()
+            breach_trend   = await self._sla_breach_trend()
+            response_trend = await self._response_time_trend()
 
-    # ── Total tickets ─────────────────────────────────────────────────────
+            logger.info(
+                "dashboard_metrics_success",
+                total_tickets=total,
+                open_tickets=open_count,
+                escalated_tickets=escalated,
+                resolved_today=resolved_today,
+            )
+
+            return DashboardMetrics(
+                total_tickets=total,
+                open_tickets=open_count,
+                escalated_tickets=escalated,
+                by_priority=by_priority,
+                sla_breach_trend=breach_trend,
+                response_time_trend=response_trend,
+                resolved_today=resolved_today,
+                avg_resolution_mins=avg_resolution,
+                sla_compliance_rate=sla_compliance,
+            )
+
+        except Exception as e:
+            logger.exception(
+                "dashboard_metrics_failed",
+                error=str(e),
+            )
+            raise
+    # ── Aggregates ──────
 
     async def _total_tickets(self) -> int:
         result = await self.db.execute(select(func.count(Ticket.id)))
         return result.scalar() or 0
-
-    # ── Open tickets (open + in_progress) ────────────────────────────────
 
     async def _open_tickets(self) -> int:
         result = await self.db.execute(
@@ -75,9 +91,14 @@ class DashboardService:
         )
         return result.scalar() or 0
 
-    # ── Priority breakdown (open + in_progress tickets only) ─────────────
+    async def _escalated_count(self) -> int:
+        result = await self.db.execute(
+            select(func.count(Ticket.id)).where(Ticket.is_escalated.is_(True))
+        )
+        return result.scalar() or 0
 
     async def _priority_breakdown(self) -> PriorityBreakdown:
+        """Count open + in-progress tickets grouped by severity/priority."""
         priority_col = getattr(Ticket, "severity", None) or getattr(Ticket, "priority", None)
         if priority_col is None:
             return PriorityBreakdown()
@@ -99,16 +120,6 @@ class DashboardService:
             low=raw.get("low", 0),
         )
 
-    # ── Escalated count ───────────────────────────────────────────────────
-
-    async def _escalated_count(self) -> int:
-        result = await self.db.execute(
-            select(func.count(Ticket.id)).where(Ticket.is_escalated.is_(True))
-        )
-        return result.scalar() or 0
-
-    # ── Resolved today ────────────────────────────────────────────────────
-
     async def _resolved_today(self) -> int:
         today    = _today_utc()
         tomorrow = today + timedelta(days=1)
@@ -123,9 +134,8 @@ class DashboardService:
         )
         return result.scalar() or 0
 
-    # ── Average resolution minutes (last 30 days) ─────────────────────────
-
     async def _avg_resolution_mins(self) -> int | None:
+        """Average resolution time in minutes over the last 30 days."""
         diff_expr = func.extract("epoch", Ticket.resolved_at - Ticket.created_at) / 60.0
         result = await self.db.execute(
             select(func.avg(diff_expr)).where(
@@ -139,13 +149,8 @@ class DashboardService:
         val = result.scalar()
         return int(val) if val is not None else None
 
-    # ── SLA compliance rate (last 30 days) ────────────────────────────────
-
     async def _sla_compliance_rate(self) -> float | None:
-        """
-        % of resolved/closed tickets resolved before their resolution_due_at.
-        Uses real Ticket.resolution_due_at and Ticket.resolved_at columns.
-        """
+        """% of resolved tickets closed before their resolution_due_at (last 30 days)."""
         result = await self.db.execute(
             select(
                 func.count(Ticket.id).label("total"),
@@ -174,24 +179,12 @@ class DashboardService:
         total, compliant = row.total or 0, row.compliant or 0
         return round(compliant / total * 100, 1) if total > 0 else None
 
-    # ── SLA breach trend (last 7 days — real data) ────────────────────────
-
     async def _sla_breach_trend(self) -> list[SLABreachTrend]:
-        """
-        Per-day SLA breach count for the last _TREND_DAYS days.
-
-        A ticket is counted as breached on its creation date when:
-          - It has been resolved and resolved_at > resolution_due_at, OR
-          - It is still open/in-progress and resolution_due_at < NOW()
-
-        Both normal and escalated deadlines are checked:
-          - Non-escalated: resolution_due_at
-          - Escalated:     escalated_resolution_due_at (falls back to resolution_due_at)
-        """
+        """Daily breach counts over the last 7 days; fills zeros for empty days."""
         now   = datetime.now(_UTC)
         since = _days_ago(_TREND_DAYS)
 
-        # Effective resolution deadline per ticket
+        # Use escalated deadline when escalated, otherwise standard deadline
         effective_deadline = case(
             (
                 and_(
@@ -203,9 +196,7 @@ class DashboardService:
             else_=Ticket.resolution_due_at,
         )
 
-        # A breach is when the deadline was missed
         is_breached = case(
-            # Resolved late
             (
                 and_(
                     Ticket.resolved_at.isnot(None),
@@ -214,7 +205,6 @@ class DashboardService:
                 ),
                 1,
             ),
-            # Still open but deadline already passed
             (
                 and_(
                     Ticket.resolved_at.is_(None),
@@ -227,7 +217,6 @@ class DashboardService:
         )
 
         day_col = func.date_trunc("day", Ticket.created_at).label("day")
-
         result = await self.db.execute(
             select(
                 day_col,
@@ -239,25 +228,22 @@ class DashboardService:
             .order_by(day_col)
         )
 
-        rows = result.all()
-
-        # Build a full 7-day series — fill in zeros for days with no tickets
         date_map: dict[date, tuple[int, int]] = {}
-        for row in rows:
+        for row in result.all():
             d = row.day.date() if hasattr(row.day, "date") else row.day
             date_map[d] = (row.total or 0, row.breaches or 0)
 
+        # Build complete 7-day series, zeroing out days with no data
         series: list[SLABreachTrend] = []
         for i in range(_TREND_DAYS - 1, -1, -1):
-            d = (_today_utc() - timedelta(days=i))
+            d = _today_utc() - timedelta(days=i)
             total, breaches = date_map.get(d, (0, 0))
             series.append(SLABreachTrend(date=d, total=total, breaches=breaches))
 
         return series
 
-    # ── Response & resolution time trend (last 7 days) ────────────────────
-
     async def _response_time_trend(self) -> list[ResponseTimeStat]:
+        """Daily avg first-response and median resolution times (last 7 days)."""
         since   = _days_ago(_TREND_DAYS)
         day_col = func.date_trunc("day", Ticket.created_at).label("day")
 
@@ -283,10 +269,8 @@ class DashboardService:
             .order_by(day_col)
         )
 
-        rows = result.all()
-
         date_map: dict[date, tuple[int, int]] = {}
-        for row in rows:
+        for row in result.all():
             d = row.day.date() if hasattr(row.day, "date") else row.day
             date_map[d] = (
                 int(row.avg_first_response_mins or 0),
@@ -295,7 +279,7 @@ class DashboardService:
 
         series: list[ResponseTimeStat] = []
         for i in range(_TREND_DAYS - 1, -1, -1):
-            d = (_today_utc() - timedelta(days=i))
+            d = _today_utc() - timedelta(days=i)
             avg_resp, med_res = date_map.get(d, (0, 0))
             series.append(ResponseTimeStat(
                 date=d,

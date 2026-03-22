@@ -1,15 +1,16 @@
+"""LangGraph pipeline for inbound email → ticket / comment routing."""
+
 from __future__ import annotations
 
-from datetime import datetime, timezone
-import httpx
 import json
-import logging
 import random
 import re
 import string
 import uuid
+from datetime import datetime, timezone
 from typing import Optional, TypedDict
 
+import httpx
 from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_groq import ChatGroq
 from langgraph.graph import END, StateGraph
@@ -33,12 +34,15 @@ from src.data.repositories.sla_repository import SLARepository
 from src.data.repositories.ticket_audit_repository import TicketAuditRepository
 from src.data.repositories.ticket_repository import TicketRepository
 from src.utils.sla_utils import compute_due_at
+from src.observability.logging.logger import get_logger
 
-logger = logging.getLogger("ticket.email_intake")
+logger = get_logger(__name__).bind(service="email-intake")
 
+
+# ── DB session factory ────────────────────────────────────────────────────────
 
 def _make_session() -> AsyncSession:
-    """Return an AsyncSession bound to the currently-running event loop."""
+    """Create a fresh AsyncSession for each graph node (nodes run independently)."""
     engine = create_async_engine(
         settings.DATABASE_URL,
         echo=False,
@@ -50,8 +54,10 @@ def _make_session() -> AsyncSession:
     return factory()
 
 
+# ── State ─────────────────────────────────────────────────────────────────────
+
 class EmailIntakeState(TypedDict, total=False):
-    # Raw inbound email
+    # Raw inbound fields
     raw_from:    str
     raw_subject: str
     raw_body:    str
@@ -62,16 +68,16 @@ class EmailIntakeState(TypedDict, total=False):
     # Resolved customer
     customer_email: str
     customer_id:    Optional[int]
-    customer_tier:  Optional[str]   
-    org_id:         Optional[int]   
+    customer_tier:  Optional[str]
+    org_id:         Optional[int]
     customer_valid: bool
 
     # Thread detection
-    is_reply:          bool
+    is_reply:           bool
     existing_thread_id: Optional[int]
     existing_ticket_id: Optional[int]
 
-    # LLM content extraction
+    # LLM extraction
     content_valid:       bool
     rejection_reason:    Optional[str]
     cleaned_title:       Optional[str]
@@ -92,9 +98,7 @@ class EmailIntakeState(TypedDict, total=False):
     error:   Optional[str]
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Internal helpers
-# ─────────────────────────────────────────────────────────────────────────────
+# ── Shared helpers ────────────────────────────────────────────────────────────
 
 def _extract_email(raw: str) -> str:
     """Extract bare address from 'Name <addr>' or plain 'addr'."""
@@ -109,32 +113,25 @@ def _generate_ticket_number() -> str:
 
 
 def _llm() -> ChatGroq:
-    return ChatGroq(
-        api_key     = settings.GROQ_API_KEY,
-        model       = settings.GROQ_MODEL,
-        temperature = 0,
-    )
+    return ChatGroq(api_key=settings.GROQ_API_KEY, model=settings.GROQ_MODEL, temperature=0)
 
 
 def _reject(state: EmailIntakeState, reason: str) -> EmailIntakeState:
-    state["customer_valid"] = False
-    state["content_valid"]  = False
+    """Mark state as rejected and record the reason."""
+    state["customer_valid"]   = False
+    state["content_valid"]    = False
     state["rejection_reason"] = reason
     return state
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Node 1 — validate_customer
-# ─────────────────────────────────────────────────────────────────────────────
+# ── Node 1: validate_customer ─────────────────────────────────────────────────
 
 async def validate_customer(state: EmailIntakeState) -> EmailIntakeState:
-    """
-    Call Auth service to check the sender is a registered CUSTOMER.
-    Populates: customer_email, customer_id, customer_tier, customer_valid.
-    """
-    raw_from = state.get("raw_from", "")
-    email    = _extract_email(raw_from)
+    """Call Auth service to confirm sender is a registered CUSTOMER."""
+    email = _extract_email(state.get("raw_from", ""))
     state["customer_email"] = email
+
+    logger.info("intake_validate_customer_started", email=email)
 
     try:
         async with httpx.AsyncClient(timeout=8.0) as client:
@@ -148,66 +145,59 @@ async def validate_customer(state: EmailIntakeState) -> EmailIntakeState:
             if data.get("role", "").lower() == "customer":
                 state["customer_id"]    = int(data["id"])
                 state["customer_tier"]  = (data.get("customer_tier") or "smb").lower()
-                state["org_id"]         = data.get("org_id")   # NEW — from auth lookup
+                state["org_id"]         = data.get("org_id")
                 state["customer_valid"] = True
                 logger.info(
-                    f"[intake] Customer validated: {email} id={data['id']} "
-                    f"tier={state['customer_tier']} org_id={state['org_id']}"
+                    "intake_customer_validated",
+                    email=email,
+                    customer_id=state["customer_id"],
+                    tier=state["customer_tier"],
                 )
                 return state
 
-        return _reject(
-            state,
-            f"No registered customer account found for {email}",
-        )
+        logger.warning("intake_customer_not_found", email=email, status=resp.status_code)
+        return _reject(state, f"No registered customer account found for {email}")
 
     except Exception as exc:
-        logger.error(f"[intake] Auth service error for {email}: {exc}")
+        logger.error("intake_auth_service_error", email=email, error=str(exc))
         return _reject(state, f"Auth service unavailable: {exc}")
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Node 2 — check_thread
-# ─────────────────────────────────────────────────────────────────────────────
+# ── Node 2: check_thread ──────────────────────────────────────────────────────
 
 async def check_thread(state: EmailIntakeState) -> EmailIntakeState:
-    """
-    Look for an existing active thread using In-Reply-To / References headers.
-    Populates: is_reply, existing_thread_id, existing_ticket_id.
-    """
+    """Match In-Reply-To / References headers to an existing active thread."""
     state["is_reply"] = False
 
     in_reply_to = state.get("in_reply_to")
     references  = state.get("references")
 
     if not in_reply_to and not references:
-        logger.debug("[intake] No reply headers — treating as new email")
+        logger.debug("intake_check_thread_no_reply_headers")
         return state
 
     async with _make_session() as session:
-        repo   = EmailThreadRepository(session)
-        thread = await repo.find_by_references(in_reply_to, references)
+        thread = await EmailThreadRepository(session).find_by_references(
+            in_reply_to, references
+        )
 
     if thread:
-        state["is_reply"]            = True
-        state["existing_thread_id"]  = thread.id
-        state["existing_ticket_id"]  = thread.ticket_id
+        state["is_reply"]           = True
+        state["existing_thread_id"] = thread.id
+        state["existing_ticket_id"] = thread.ticket_id
         logger.info(
-            f"[intake] Reply matched thread_id={thread.id} "
-            f"ticket_id={thread.ticket_id}"
+            "intake_thread_matched",
+            thread_id=thread.id,
+            ticket_id=thread.ticket_id,
         )
     else:
-        logger.debug(
-            "[intake] Reply headers present but no active thread found — "
-            "treating as new ticket"
-        )
+        # Headers present but no matching thread — treat as a new ticket
+        logger.debug("intake_thread_not_matched")
 
     return state
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Node 3 — validate_content  (LLM)
-# ─────────────────────────────────────────────────────────────────────────────
+# ── Node 3: validate_content (LLM) ───────────────────────────────────────────
 
 _CONTENT_SYSTEM = """\
 You are a support email triage assistant for a SaaS ticketing system.
@@ -243,20 +233,16 @@ JSON schema (always include ALL keys):
 
 
 async def validate_content(state: EmailIntakeState) -> EmailIntakeState:
-    """
-    Use Groq LLM to validate the email is a genuine support request
-    and extract structured ticket fields.
-    Used for both new emails and replies (to strip blank/quoted bodies).
-    """
+    """Use Groq LLM to confirm genuine support request and extract structured fields."""
     subject = state.get("raw_subject", "")
     body    = state.get("raw_body", "")
 
-    prompt = f"Subject: {subject}\n\nBody:\n{body[:4000]}"
+    logger.info("intake_validate_content_started")
 
     try:
         response = await _llm().ainvoke([
             SystemMessage(content=_CONTENT_SYSTEM),
-            HumanMessage(content=prompt),
+            HumanMessage(content=f"Subject: {subject}\n\nBody:\n{body[:4000]}"),
         ])
         raw_text = re.sub(r"```(?:json)?|```", "", response.content).strip()
         parsed   = json.loads(raw_text)
@@ -268,34 +254,26 @@ async def validate_content(state: EmailIntakeState) -> EmailIntakeState:
         state["issue_category_str"]  = parsed.get("issue_category")
 
         logger.info(
-            f"[intake] Content validation: valid={state['content_valid']} "
-            f"category={state['issue_category_str']!r}"
+            "intake_content_validated",
+            content_valid=state["content_valid"],
+            category=state["issue_category_str"],
         )
 
     except Exception as exc:
-        logger.error(f"[intake] LLM content validation failed: {exc}")
+        logger.error("intake_content_validation_failed", error=str(exc))
         state["content_valid"]    = False
         state["rejection_reason"] = f"Content validation error: {exc}"
 
     return state
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Node 4 — classify_issue
-# ─────────────────────────────────────────────────────────────────────────────
+# ── Node 4: classify_issue ────────────────────────────────────────────────────
 
 _CATEGORY_MAP: dict[str, str] = {c.value: c.value for c in IssueCategory}
 
 
 async def classify_issue(state: EmailIntakeState) -> EmailIntakeState:
-    """
-    Map LLM-extracted issue_category string to a live Issue row in the DB.
-
-    Strategy:
-      1. Match by category enum value.
-      2. Fall back to IssueCategory.OTHER.
-      3. If DB has no issues at all → reject.
-    """
+    """Map LLM category string to a live Issue row. Falls back to OTHER."""
     cat_str = (state.get("issue_category_str") or "other").lower().strip()
     cat_val = _CATEGORY_MAP.get(cat_str, IssueCategory.OTHER.value)
 
@@ -303,79 +281,79 @@ async def classify_issue(state: EmailIntakeState) -> EmailIntakeState:
         issues = await IssueRepository(session).get_all(active_only=True)
 
     if not issues:
+        logger.error("intake_classify_no_active_issues")
         state["content_valid"]    = False
         state["rejection_reason"] = "No active issue categories in database"
-        logger.error("[intake] classify_issue: no active issues found")
         return state
 
-    # 1. Exact category match
-    matched = [i for i in issues if i.category.value == cat_val]
-    # 2. Fallback to OTHER
-    if not matched:
-        matched = [i for i in issues if i.category == IssueCategory.OTHER]
-    # 3. Last resort
-    if not matched:
-        matched = [issues[0]]
+    matched = (
+        [i for i in issues if i.category.value == cat_val]
+        or [i for i in issues if i.category == IssueCategory.OTHER]
+        or [issues[0]]
+    )
 
     state["issue_id"]   = matched[0].id
     state["issue_name"] = matched[0].name
     logger.info(
-        f"[intake] Issue classified: id={matched[0].id} "
-        f"name={matched[0].name!r} category={cat_val}"
+        "intake_issue_classified",
+        issue_id=matched[0].id,
+        issue_name=matched[0].name,
+        category=cat_val,
     )
     return state
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Node 5 — detect_severity
-# ─────────────────────────────────────────────────────────────────────────────
+# ── Node 5: detect_severity ───────────────────────────────────────────────────
 
 async def detect_severity(state: EmailIntakeState) -> EmailIntakeState:
+    """Run SeverityAgent then apply enterprise tier bump."""
     title       = state.get("cleaned_title")       or state.get("raw_subject", "")
     description = state.get("cleaned_description") or state.get("raw_body", "")
     issue_name  = state.get("issue_name")           or ""
 
     async with _make_session() as session:
         severity = await SeverityAgent(session).detect(
-            issue_name  = issue_name,
-            title       = title,
-            description = description,
+            issue_name=issue_name, title=title, description=description,
         )
 
     sev = severity.value
 
+    # Enterprise tier gets a severity bump for faster SLA
     if (state.get("customer_tier") or "smb").lower() == "enterprise":
         if sev == "high":     sev = "critical"
         elif sev == "medium": sev = "high"
         elif sev == "low":    sev = "medium"
 
     state["severity"] = sev
-    logger.info(f"[intake] Severity: {sev}")
+    logger.info("intake_severity_detected", severity=sev)
     return state
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Node 6 — create_ticket
-# ─────────────────────────────────────────────────────────────────────────────
+
+# ── Node 6: create_ticket ─────────────────────────────────────────────────────
 
 async def create_ticket(state: EmailIntakeState) -> EmailIntakeState:
     """
-    Full ticket creation — mirrors web TicketService.create_ticket exactly:
-      SLA lookup → priority mapping → team routing → DB insert →
-      audit log → Celery acknowledgement email → in-app notification →
-      email_thread record.
+    Create ticket from email: SLA lookup → priority mapping → DB insert →
+    audit log → Celery ack email → in-app notification → thread record.
     """
     from src.constants.sla_constants import Severity
 
     customer_id    = state["customer_id"]
     customer_email = state["customer_email"]
-    # Plain lowercase string from auth service lookup — no longer an enum.
     customer_tier  = (state.get("customer_tier") or "smb").lower()
-    org_id         = state.get("org_id")   # NEW — from validate_customer node
+    org_id         = state.get("org_id")
     severity       = Severity(state["severity"])
     issue_id       = state["issue_id"]
     title          = state["cleaned_title"]
     description    = state["cleaned_description"]
     message_id     = state["message_id"]
+
+    logger.info(
+        "intake_create_ticket_started",
+        customer_id=customer_id,
+        severity=severity.value,
+        issue_id=issue_id,
+    )
 
     try:
         async with _make_session() as session:
@@ -387,29 +365,29 @@ async def create_ticket(state: EmailIntakeState) -> EmailIntakeState:
                 thread_repo   = EmailThreadRepository(session)
                 notif_svc     = NotificationService(session)
 
-                # ── SLA ────────────────────────────────────────────────────────
                 sla = await sla_repo.get_by_tier_and_severity(customer_tier, severity)
                 response_due_at = resolution_due_at = sla_id = None
                 sla_resolution_hrs: float | None = None
+
                 if sla:
                     response_due_at    = compute_due_at(sla.response_time_mins)
                     resolution_due_at  = compute_due_at(sla.resolution_time_mins)
                     sla_id             = sla.id
                     sla_resolution_hrs = round(sla.resolution_time_mins / 60, 1)
-                    logger.info(f"[intake] SLA matched: {sla.name} (id={sla.id})")
+                    logger.info("intake_sla_matched", sla_id=sla.id, sla_name=sla.name)
                 else:
                     logger.warning(
-                        f"[intake] No SLA for tier={customer_tier} severity={severity}"
+                        "intake_sla_not_found",
+                        customer_tier=customer_tier,
+                        severity=severity.value,
                     )
 
-                # ── Priority — email has no customer-chosen priority, use system ──
+                # Email has no customer-chosen priority — use system-derived value
                 system_priority = SEVERITY_TO_PRIORITY[severity]
 
-                # ── Team routing ───────────────────────────────────────────────
                 resolvers = await resolver_repo.get_by_issue(issue_id)
                 team_id: int | None = resolvers[0].team_id if resolvers else None
 
-                # ── Create ticket ──────────────────────────────────────────────
                 ticket_number = _generate_ticket_number()
                 ticket = await ticket_repo.create(
                     ticket_number                   = ticket_number,
@@ -420,7 +398,6 @@ async def create_ticket(state: EmailIntakeState) -> EmailIntakeState:
                     customer_tier                   = customer_tier,
                     org_id                          = org_id,
                     issue_id                        = issue_id,
-                    # email has no customer priority choice — set same as system
                     customer_priority               = system_priority,
                     priority                        = system_priority,
                     priority_overridden             = False,
@@ -436,7 +413,6 @@ async def create_ticket(state: EmailIntakeState) -> EmailIntakeState:
                     attachments                     = None,
                 )
 
-                # ── Audit log ──────────────────────────────────────────────────
                 await audit_repo.log(
                     ticket_id  = ticket.id,
                     action     = AuditAction.CREATED,
@@ -451,7 +427,6 @@ async def create_ticket(state: EmailIntakeState) -> EmailIntakeState:
                     },
                 )
 
-                # ── Email thread record ────────────────────────────────────────
                 await thread_repo.create(
                     customer_email = customer_email,
                     message_id     = message_id,
@@ -460,7 +435,6 @@ async def create_ticket(state: EmailIntakeState) -> EmailIntakeState:
                     status         = EmailThreadStatus.ACTIVE,
                 )
 
-                # ── In-app notification ────────────────────────────────────────
                 await notif_svc.ticket_created(
                     recipient_id  = customer_id,
                     ticket_id     = ticket.id,
@@ -468,9 +442,7 @@ async def create_ticket(state: EmailIntakeState) -> EmailIntakeState:
                     ticket_title  = title,
                 )
 
-            # commit is implicit via session.begin() context manager
-
-        # ── Celery: acknowledgement email (outside the DB transaction) ─────────
+        # Celery task runs outside the DB transaction to avoid blocking commit
         send_ticket_acknowledgement_task.delay(
             ticket_id           = ticket.id,
             to_email            = customer_email,
@@ -488,49 +460,42 @@ async def create_ticket(state: EmailIntakeState) -> EmailIntakeState:
         state["ticket_number"] = ticket_number
         state["outcome"]       = "ticket_created"
         logger.info(
-            f"[intake] Ticket created: {ticket_number} | "
-            f"customer={customer_email} | severity={severity.value}"
+            "intake_ticket_created",
+            ticket_number=ticket_number,
+            customer_email=customer_email,
+            severity=severity.value,
         )
 
     except Exception as exc:
+        logger.error("intake_create_ticket_failed", error=str(exc), exc_info=True)
         state["outcome"] = "rejected"
         state["error"]   = f"Ticket creation failed: {exc}"
-        logger.error(f"[intake] create_ticket error: {exc}", exc_info=True)
 
     return state
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Node 7 — add_comment  (reply path)
-# ─────────────────────────────────────────────────────────────────────────────
+# ── Node 7: add_comment ───────────────────────────────────────────────────────
 
 async def add_comment(state: EmailIntakeState) -> EmailIntakeState:
-    """
-    Customer replied to a ticket email.
-    Add the reply body as a Comment on the existing ticket.
-    Touch the thread's last_email_at.
-    Notify the assigned agent (in-app).
-    """
+    """Add customer reply as a comment on the existing ticket and notify the agent."""
     ticket_id   = state["existing_ticket_id"]
     thread_id   = state["existing_thread_id"]
     customer_id = state["customer_id"]
     body        = state.get("raw_body", "").strip()
 
-    # Strip quoted reply lines (lines starting with ">") and blank lines
+    # Strip quoted reply lines and blank lines
     cleaned_body = "\n".join(
         line for line in body.splitlines()
         if not line.startswith(">") and line.strip()
     ).strip()
 
     if not cleaned_body:
+        logger.info("intake_add_comment_empty_body", ticket_id=ticket_id)
         state["outcome"]          = "rejected"
-        state["rejection_reason"] = (
-            "Reply body was empty after stripping quoted text"
-        )
-        logger.info(
-            f"[intake] Reply to ticket_id={ticket_id} rejected: empty body"
-        )
+        state["rejection_reason"] = "Reply body was empty after stripping quoted text"
         return state
+
+    logger.info("intake_add_comment_started", ticket_id=ticket_id, customer_id=customer_id)
 
     try:
         async with _make_session() as session:
@@ -542,11 +507,11 @@ async def add_comment(state: EmailIntakeState) -> EmailIntakeState:
 
                 ticket = await ticket_repo.get_by_id(ticket_id)
                 if not ticket:
+                    logger.warning("intake_add_comment_ticket_not_found", ticket_id=ticket_id)
                     state["outcome"]          = "rejected"
                     state["rejection_reason"] = f"Ticket {ticket_id} not found"
                     return state
 
-                # Add comment
                 await comment_repo.create(
                     ticket_id   = ticket_id,
                     author_id   = customer_id,
@@ -555,13 +520,12 @@ async def add_comment(state: EmailIntakeState) -> EmailIntakeState:
                     source      = CommentSource.EMAIL,
                 )
 
-                # Bump thread timestamp
+                # Bump thread timestamp so idle-detection queries see activity
                 from src.data.models.postgres.email_thread_model import EmailThread
                 thread = await session.get(EmailThread, thread_id)
                 if thread:
                     thread.last_email_at = datetime.now(timezone.utc)
 
-                # In-app notification → assigned agent
                 if ticket.assigned_agent_id:
                     await notif_svc.comment_received(
                         recipient_id   = ticket.assigned_agent_id,
@@ -577,27 +541,24 @@ async def add_comment(state: EmailIntakeState) -> EmailIntakeState:
         state["ticket_number"] = ticket.ticket_number
         state["outcome"]       = "comment_added"
         logger.info(
-            f"[intake] Comment added to ticket_id={ticket_id} "
-            f"({ticket.ticket_number}) from {state['customer_email']}"
+            "intake_comment_added",
+            ticket_id=ticket_id,
+            ticket_number=ticket.ticket_number,
+            customer_email=state["customer_email"],
         )
 
     except Exception as exc:
+        logger.error("intake_add_comment_failed", error=str(exc), exc_info=True)
         state["outcome"] = "rejected"
         state["error"]   = f"Comment creation failed: {exc}"
-        logger.error(f"[intake] add_comment error: {exc}", exc_info=True)
 
     return state
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Node 8 — reject_email
-# ─────────────────────────────────────────────────────────────────────────────
+# ── Node 8: reject_email ──────────────────────────────────────────────────────
 
 async def reject_email(state: EmailIntakeState) -> EmailIntakeState:
-    """
-    Record rejection in email_threads so we have an audit trail.
-    Does NOT send an auto-reply (avoids backscatter to unknown senders).
-    """
+    """Record rejection in email_threads for audit trail. No auto-reply sent."""
     reason     = state.get("rejection_reason", "Unknown reason")
     email      = state.get("customer_email") or state.get("raw_from", "unknown")
     message_id = state.get("message_id")     or f"unknown-{uuid.uuid4()}"
@@ -607,7 +568,7 @@ async def reject_email(state: EmailIntakeState) -> EmailIntakeState:
         async with _make_session() as session:
             async with session.begin():
                 repo = EmailThreadRepository(session)
-                # Guard: don't insert duplicate message_id
+                # Guard: skip if this message_id was already recorded
                 existing = await repo.get_by_message_id(message_id)
                 if not existing:
                     await repo.create(
@@ -619,18 +580,14 @@ async def reject_email(state: EmailIntakeState) -> EmailIntakeState:
                         rejection_reason = reason,
                     )
     except Exception as exc:
-        logger.error(f"[intake] reject_email DB write error: {exc}")
+        logger.error("intake_reject_email_db_failed", error=str(exc))
 
     state["outcome"] = "rejected"
-    logger.info(
-        f"[intake] Email rejected | reason={reason!r} | from={email}"
-    )
+    logger.info("intake_email_rejected", reason=reason, email=email)
     return state
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Routing functions
-# ─────────────────────────────────────────────────────────────────────────────
+# ── Routing functions ─────────────────────────────────────────────────────────
 
 def _route_customer(state: EmailIntakeState) -> str:
     return "check_thread" if state.get("customer_valid") else "reject_email"
@@ -654,54 +611,41 @@ def _route_classify(state: EmailIntakeState) -> str:
     return "detect_severity" if state.get("content_valid") else "reject_email"
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Build and compile the graph
-# ─────────────────────────────────────────────────────────────────────────────
+# ── Graph definition ──────────────────────────────────────────────────────────
 
 def build_email_intake_graph():
     g = StateGraph(EmailIntakeState)
 
-    # ── Register nodes ────────────────────────────────────────────────────────
-    g.add_node("validate_customer",        validate_customer)
-    g.add_node("check_thread",             check_thread)
-    g.add_node("validate_content",         validate_content)
-    g.add_node("reply_validate_content",   validate_content)   # same fn, reply branch
-    g.add_node("classify_issue",           classify_issue)
-    g.add_node("detect_severity",          detect_severity)
-    g.add_node("create_ticket",            create_ticket)
-    g.add_node("add_comment",              add_comment)
-    g.add_node("reject_email",             reject_email)
+    g.add_node("validate_customer",      validate_customer)
+    g.add_node("check_thread",           check_thread)
+    g.add_node("validate_content",       validate_content)
+    g.add_node("reply_validate_content", validate_content)   # same fn, reply branch
+    g.add_node("classify_issue",         classify_issue)
+    g.add_node("detect_severity",        detect_severity)
+    g.add_node("create_ticket",          create_ticket)
+    g.add_node("add_comment",            add_comment)
+    g.add_node("reject_email",           reject_email)
 
-    # ── Entry point ───────────────────────────────────────────────────────────
     g.set_entry_point("validate_customer")
 
-    # ── Edges ─────────────────────────────────────────────────────────────────
     g.add_conditional_edges(
-        "validate_customer",
-        _route_customer,
+        "validate_customer", _route_customer,
         {"check_thread": "check_thread", "reject_email": "reject_email"},
     )
     g.add_conditional_edges(
-        "check_thread",
-        _route_thread,
-        {
-            "validate_content":       "validate_content",
-            "reply_validate_content": "reply_validate_content",
-        },
+        "check_thread", _route_thread,
+        {"validate_content": "validate_content", "reply_validate_content": "reply_validate_content"},
     )
     g.add_conditional_edges(
-        "validate_content",
-        _route_content,
+        "validate_content", _route_content,
         {"classify_issue": "classify_issue", "reject_email": "reject_email"},
     )
     g.add_conditional_edges(
-        "reply_validate_content",
-        _route_reply_content,
+        "reply_validate_content", _route_reply_content,
         {"add_comment": "add_comment", "reject_email": "reject_email"},
     )
     g.add_conditional_edges(
-        "classify_issue",
-        _route_classify,
+        "classify_issue", _route_classify,
         {"detect_severity": "detect_severity", "reject_email": "reject_email"},
     )
 
