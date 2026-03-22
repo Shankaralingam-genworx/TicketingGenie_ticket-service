@@ -1,9 +1,5 @@
-"""
-Assignment service.
-File: src/core/services/assignment_service.py
-"""
+"""Ticket assignment and escalation reassignment."""
 
-import logging
 from datetime import datetime, timezone
 
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -27,11 +23,13 @@ from src.data.repositories.ticket_audit_repository import TicketAuditRepository
 from src.data.repositories.ticket_repository import TicketRepository
 from src.schemas.ticket_schema import EscalationReassignRequest, TicketResponse
 from src.utils.sla_utils import compute_due_at
+from src.observability.logging.logger import get_logger
 
-logger = logging.getLogger("ticket.assignment")
+logger = get_logger(__name__).bind(service="ticket-service")
 
 
 class AssignmentService:
+
     def __init__(self, db: AsyncSession):
         self.ticket_repo     = TicketRepository(db)
         self.audit_repo      = TicketAuditRepository(db)
@@ -50,17 +48,35 @@ class AssignmentService:
         actor_role:    str,
         actor_team_id: int | None = None,
     ) -> TicketResponse:
+        logger.info(
+            "assign_ticket_started",
+            ticket_id=ticket_id,
+            agent_id=agent_id,
+            actor_id=actor_id,
+            actor_role=actor_role,
+        )
+
         ticket = await self.ticket_repo.get_by_id(ticket_id)
         if not ticket:
+            logger.warning("assign_ticket_not_found", ticket_id=ticket_id)
             raise NotFoundException("Ticket", ticket_id)
 
+        # Team leads can only assign tickets within their own team
         if actor_role == "team_lead":
             if actor_team_id is None or ticket.team_id != actor_team_id:
+                logger.warning(
+                    "assign_ticket_forbidden_team_lead",
+                    actor_id=actor_id,
+                    ticket_team_id=ticket.team_id,
+                    actor_team_id=actor_team_id,
+                )
                 raise ForbiddenException(
                     "Team leads can only assign tickets belonging to their team."
                 )
 
+        # Escalated tickets must go through the escalation reassign flow
         if ticket.is_escalated:
+            logger.warning("assign_ticket_is_escalated", ticket_id=ticket_id)
             raise ConflictException(
                 "Ticket is escalated. Use POST /tickets/{id}/escalation/reassign "
                 "to reassign it to a new agent."
@@ -69,6 +85,7 @@ class AssignmentService:
         old_agent = ticket.assigned_agent_id
         updates: dict = {"assigned_agent_id": agent_id}
 
+        # Auto-advance status on first assignment
         if ticket.status in (TicketStatus.NEW, TicketStatus.ACKNOWLEDGED):
             updates["status"] = TicketStatus.ASSIGNED
 
@@ -81,9 +98,12 @@ class AssignmentService:
         )
 
         await self._send_assignment_notifications(ticket, agent_id)
+
         logger.info(
-            f"Ticket {ticket.ticket_number} assigned → agent={agent_id} "
-            f"by {actor_role}={actor_id}  status={ticket.status.value}"
+            "assignment_success",
+            ticket_number=ticket.ticket_number,
+            agent_id=agent_id,
+            status=ticket.status.value,
         )
         return TicketResponse.model_validate(ticket)
 
@@ -97,68 +117,69 @@ class AssignmentService:
         actor_role:    str,
         actor_team_id: int | None = None,
     ) -> TicketResponse:
-        """
-        Team lead reassigns an escalated ticket.
+        logger.info(
+            "reassign_escalated_ticket_started",
+            ticket_id=ticket_id,
+            new_agent_id=data.new_agent_id,
+            actor_id=actor_id,
+            actor_role=actor_role,
+        )
 
-        SLA window resolution order (highest priority first):
-          1. data.escalated_response_mins    (lead override per-reassignment)
-          2. sla.additional_response_mins    (admin-configured policy default)
-          3. sla.response_time_mins          (fallback: use original response window)
-
-        Same priority order for resolution mins.
-
-        After this call:
-          ticket.escalated_response_due_at   = NOW + resolved_response_mins
-            → new agent's "Start Working" deadline
-          ticket.escalated_resolution_due_at = None (set later in start_working)
-          ticket.work_started_at             = None (new agent must click Start Working)
-          ticket.status                      = ASSIGNED
-          escalation.new_agent_id            = data.new_agent_id
-        """
         ticket = await self.ticket_repo.get_by_id(ticket_id)
         if not ticket:
+            logger.warning("reassign_escalated_ticket_not_found", ticket_id=ticket_id)
             raise NotFoundException("Ticket", ticket_id)
 
         if not ticket.is_escalated:
+            logger.warning("reassign_escalated_ticket_not_escalated", ticket_id=ticket_id)
             raise ConflictException(
                 "Ticket is not escalated. Use PATCH /tickets/{id}/assign."
             )
 
         if actor_role == "team_lead":
             if actor_team_id is None or ticket.team_id != actor_team_id:
+                logger.warning(
+                    "reassign_escalated_ticket_forbidden_team_lead",
+                    actor_id=actor_id,
+                    ticket_team_id=ticket.team_id,
+                    actor_team_id=actor_team_id,
+                )
                 raise ForbiddenException(
                     "Team leads can only reassign tickets in their team."
                 )
 
         escalation = await self.escalation_repo.get_by_ticket(ticket_id)
         if not escalation:
+            logger.warning("reassign_escalated_ticket_no_escalation_record", ticket_id=ticket_id)
             raise NotFoundException("Escalation record for ticket", ticket_id)
 
+        # Prevent routing back to the agent who was escalated away from
         if data.new_agent_id == escalation.old_agent_id:
+            logger.warning(
+                "reassign_escalated_ticket_same_agent",
+                ticket_id=ticket_id,
+                old_agent_id=escalation.old_agent_id,
+            )
             raise ConflictException(
                 "Cannot reassign escalated ticket back to the same agent who was escalated."
             )
 
-        # ── Resolve SLA windows ───────────────────────────────────────────────
-        # Fetch the ticket's SLA policy to read additional_*_mins defaults
+        # Resolve SLA windows: lead override → policy additional → policy normal → None
         sla = await self.sla_repo.get_by_id(ticket.sla_id) if ticket.sla_id else None
 
-        # Response window for new agent: override → policy additional → policy normal
         if data.escalated_response_mins is not None:
             response_mins = data.escalated_response_mins
-            logger.info(f"[escalation] Using lead-override response window: {response_mins} mins")
+            logger.info("escalation_response_window_override", response_mins=response_mins)
         elif sla and sla.additional_response_mins > 0:
             response_mins = sla.additional_response_mins
-            logger.info(f"[escalation] Using SLA additional_response_mins: {response_mins} mins")
+            logger.info("escalation_response_window_sla_additional", response_mins=response_mins)
         elif sla:
             response_mins = sla.response_time_mins
-            logger.info(f"[escalation] Falling back to SLA response_time_mins: {response_mins} mins")
+            logger.info("escalation_response_window_sla_fallback", response_mins=response_mins)
         else:
             response_mins = None
-            logger.warning(f"[escalation] No SLA found for ticket {ticket.ticket_number} — no response deadline set")
+            logger.warning("escalation_response_window_missing", ticket_id=ticket_id)
 
-        # Resolution window: stored in escalation record, applied in start_working()
-        # We just record the override here if provided
         if data.escalated_resolution_mins is not None:
             resolution_mins_override = data.escalated_resolution_mins
         elif sla and sla.additional_resolution_mins > 0:
@@ -168,7 +189,6 @@ class AssignmentService:
         else:
             resolution_mins_override = None
 
-        # ── Update escalation record ──────────────────────────────────────────
         now = datetime.now(timezone.utc)
         await self.escalation_repo.assign_new_agent(
             escalation,
@@ -176,21 +196,15 @@ class AssignmentService:
             escalated_resolution_mins = resolution_mins_override,
         )
 
-        # ── Build ticket updates ──────────────────────────────────────────────
         updates: dict = {
-            "assigned_agent_id":         data.new_agent_id,
-            "status":                    TicketStatus.ASSIGNED,
-            "work_started_at":           None,             # new agent must click Start Working
-            "escalated_resolution_due_at": None,           # set in start_working()
+            "assigned_agent_id":           data.new_agent_id,
+            "status":                      TicketStatus.ASSIGNED,
+            "work_started_at":             None,   # new agent must click Start Working
+            "escalated_resolution_due_at": None,   # set when agent starts working
         }
 
-        # Set escalated response deadline (new agent must Start Working by this time)
         if response_mins is not None:
             updates["escalated_response_due_at"] = compute_due_at(response_mins, from_time=now)
-            logger.info(
-                f"[escalation] escalated_response_due_at={updates['escalated_response_due_at']} "
-                f"({response_mins} mins from now)"
-            )
 
         ticket = await self.ticket_repo.update(ticket, **updates)
         await self.audit_repo.log(
@@ -198,46 +212,39 @@ class AssignmentService:
             actor_id=actor_id, actor_role=actor_role,
             old_value={"assigned_agent_id": escalation.old_agent_id},
             new_value={
-                "assigned_agent_id":          data.new_agent_id,
-                "status":                     TicketStatus.ASSIGNED.value,
-                "escalated_response_due_at":  ticket.escalated_response_due_at.isoformat()
-                                              if ticket.escalated_response_due_at else None,
-                "escalated_resolution_mins":  resolution_mins_override,
+                "assigned_agent_id":         data.new_agent_id,
+                "status":                    TicketStatus.ASSIGNED.value,
+                "escalated_response_due_at": (
+                    ticket.escalated_response_due_at.isoformat()
+                    if ticket.escalated_response_due_at else None
+                ),
+                "escalated_resolution_mins": resolution_mins_override,
             },
         )
 
         await self._send_assignment_notifications(ticket, data.new_agent_id, is_escalation=True)
+
         logger.info(
-            f"Escalated ticket {ticket.ticket_number} reassigned: "
-            f"old_agent={escalation.old_agent_id} → new_agent={data.new_agent_id} | "
-            f"escalated_response_due_at={ticket.escalated_response_due_at}"
+            "reassign_escalated_ticket_success",
+            ticket_number=ticket.ticket_number,
+            old_agent_id=escalation.old_agent_id,
+            new_agent_id=data.new_agent_id,
+            escalated_response_due_at=ticket.escalated_response_due_at,
         )
         return TicketResponse.model_validate(ticket)
 
-    # ── Shared notification helper ────────────────────────────────────────────
+    # ── Notification helper ───────────────────────────────────────────────────
 
     async def _send_assignment_notifications(
         self, ticket, agent_id: int, is_escalation: bool = False
     ) -> None:
-        """
-        Fire email + in-app notifications after any assignment or reassignment.
-
-        Normal assignment  (is_escalation=False):
-          - Agent  : build_agent_assigned_email       + in-app ticket_assigned_agent
-          - Customer: build_assignment_email           + in-app ticket_assigned
-
-        Escalated reassignment (is_escalation=True):
-          - Agent  : build_escalation_agent_reassignment_email + in-app ticket_assigned_agent
-          - Customer: build_assignment_email (same copy)       + in-app ticket_assigned
-        """
+        """Send email + in-app notifications to both agent and customer."""
         severity = ticket.severity.value if hasattr(ticket.severity, "value") else str(ticket.severity)
         priority = ticket.priority.value if hasattr(ticket.priority, "value") else str(ticket.priority)
 
-        # ── Agent notifications ───────────────────────────────────────────────
         agent_email = await self.user_repo.get_user_email(agent_id)
         if agent_email:
             if is_escalation:
-                # Show response deadline if available
                 response_due_str = (
                     ticket.escalated_response_due_at.strftime("%Y-%m-%d %H:%M UTC")
                     if ticket.escalated_response_due_at else None
@@ -268,7 +275,6 @@ class AssignmentService:
                 notification_type = notification_type,
             )
 
-        # ── Agent in-app ──────────────────────────────────────────────────────
         await self.notif_svc.ticket_assigned_agent(
             recipient_id  = agent_id,
             ticket_id     = ticket.id,
@@ -276,7 +282,6 @@ class AssignmentService:
             ticket_title  = ticket.title,
         )
 
-        # ── Customer email ────────────────────────────────────────────────────
         send_notification_task.delay(
             **vars(build_assignment_email(
                 to_email      = ticket.customer_email,
@@ -287,7 +292,6 @@ class AssignmentService:
             notification_type = "assignment_customer",
         )
 
-        # ── Customer in-app ───────────────────────────────────────────────────
         await self.notif_svc.ticket_assigned(
             recipient_id  = ticket.customer_id,
             ticket_id     = ticket.id,

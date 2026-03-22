@@ -7,15 +7,15 @@ Reusable for:
 - SLA breach alerts
 """
 
-import logging
 import smtplib
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from typing import Optional
 
 from src.config.settings import settings
+from src.observability.logging.logger import get_logger
 
-logger = logging.getLogger("ticket.email")
+logger = get_logger(__name__).bind(service="ticket-service")
 
 
 class EmailService:
@@ -42,6 +42,12 @@ class EmailService:
         Accepts HTML + optional plain text fallback.
         """
 
+        logger.info(
+            "email_send_started",
+            to_email=to_email,
+            subject=subject,
+        )
+
         msg = MIMEMultipart("alternative")
         msg["Subject"] = subject
         msg["From"] = self.from_email
@@ -59,8 +65,17 @@ class EmailService:
                 server.login(self.user, self.password)
                 server.sendmail(self.from_email, to_email, msg.as_string())
 
-            logger.info(f"Email sent → {to_email} | {subject}")
+            logger.info(
+                "email_send_success",
+                to_email=to_email,
+                subject=subject,
+            )
 
         except Exception as e:
             # Do NOT crash ticket creation
-            logger.error(f"Email sending failed → {to_email} | {e}")
+            logger.exception(
+                "email_send_failed",
+                to_email=to_email,
+                subject=subject,
+                error=str(e),
+            )

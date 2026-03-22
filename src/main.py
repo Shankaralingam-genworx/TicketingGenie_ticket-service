@@ -1,49 +1,40 @@
 """Entry point for the Ticket Service."""
 
-import logging
 from contextlib import asynccontextmanager
 
 import uvicorn
 from fastapi import FastAPI
-from src.init_db import main as init_database       
 
+from src.init_db import main as init_database
 from src.data.clients.postgres_client import create_tables
+from src.observability.logging.logger import setup_logging, get_logger
 
-
-def setup_logging() -> None:
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s | %(levelname)-8s | %(name)s | %(message)s",
-        datefmt="%Y-%m-%d %H:%M:%S",
-    )
-    logging.getLogger("sqlalchemy.engine").setLevel(logging.WARNING)
-    logging.getLogger("uvicorn.access").setLevel(logging.WARNING)
-
-
+# Setup structured logging
 setup_logging()
-logger = logging.getLogger("ticket.main")
+logger = get_logger(__name__).bind(service="ticket-service")
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    logger.info("Starting Ticketing Genie — Ticket Service...")
+    logger.info("service_starting")
 
     await create_tables()
-    logger.info("Database tables created / verified.")
+    logger.info("db_tables_ready")
 
     await init_database()
 
-    logger.info("Ticket Service ready.")
+    logger.info("service_ready")
     yield
 
-    logger.info("Ticket Service shutting down.")
+    logger.info("service_stopping")
 
 
-# Import after logging setup to avoid circular imports
+# Import after logging setup
 from src.api.rest.app import create_app  # noqa: E402
 
 app = create_app()
 app.router.lifespan_context = lifespan
+
 
 if __name__ == "__main__":
     from src.config.settings import settings
